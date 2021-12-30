@@ -1,4 +1,12 @@
 {
-    "coc.preferences.formatOnSaveFiletypes": ["javascript", "json", "css", "markdown"],
-    "prettier.singleQuote": true
+  "coc.preferences.formatOnSaveFiletypes": [
+    "javascript",
+    "json",
+    "css",
+    "markdown",
+    "python"
+  ],
+  "prettier.singleQuote": true,
+  "python.analysis.stubPath": "",
+  "python.formatting.autopep8Path": ""
 }
