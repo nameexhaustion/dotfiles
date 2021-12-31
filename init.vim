@@ -55,12 +55,12 @@ call plug#end()
 let g:lightline= {
     \ 'colorscheme': 'one',
     \ 'active': {
-	\   'left': [ [ 'mode', 'paste' ],
-	\             [ 'readonly', 'filename', 'modified', 'coc_error', 'coc_warning', 'coc_hint', 'coc_info' ] ],
-	\   'right': [ [ 'lineinfo',  ],
-	\              [ 'percent' ],
-	\              [ 'fileformat', 'fileencoding', 'filetype'] ]
-	\ },
+    \   'left': [ [ 'mode', 'paste' ],
+    \             [ 'readonly', 'filename', 'modified', 'coc_error', 'coc_warning', 'coc_hint', 'coc_info' ] ],
+    \   'right': [ [ 'lineinfo',  ],
+    \              [ 'percent' ],
+    \              [ 'fileformat', 'fileencoding', 'filetype'] ]
+    \ },
     \ 'component_expand': {
     \   'coc_error'        : 'LightlineCocErrors',
     \   'coc_warning'      : 'LightlineCocWarnings',
@@ -125,8 +125,8 @@ endif
 
 " Make <CR> auto-select the first completion item and notify coc.nvim to
 " format on enter, <cr> could be remapped by other vim plugin
-inoremap <silent><expr> <cr> pumvisible() ? coc#_select_confirm()
-                              \: "\<C-g>u\<CR>\<c-r>=coc#on_enter()\<CR>"
+" inoremap <silent><expr> <cr> pumvisible() ? coc#_select_confirm()
+"                               \: "\<C-g>u\<CR>\<c-r>=coc#on_enter()\<CR>"
 
 " Use `[g` and `]g` to navigate diagnostics
 " Use `:CocDiagnostics` to get all diagnostics of current buffer in location list.
