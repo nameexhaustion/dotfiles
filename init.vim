@@ -2,6 +2,8 @@ filetype plugin indent on
 syntax on
 set t_Co=256
 
+set encoding=UTF-8
+
 set clipboard=unnamedplus
 set completeopt=noinsert,menuone,noselect
 set hidden
