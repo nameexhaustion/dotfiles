@@ -105,6 +105,11 @@ autocmd User CocStatusChange,CocDiagnosticChange call lightline#update()
 
 let g:NERDTreeShowHidden=1
 
+let g:NERDCreateDefaultMappings = 1
+let g:NERDSpaceDelims=1
+let g:NERDCommentEmptyLines = 1
+
+
 colorscheme onehalflight
 
 set nobackup
