@@ -114,7 +114,6 @@ colorscheme onehalflight
 
 set nobackup
 set nowritebackup
-set cmdheight=2
 
 " Use <c-space> to trigger completion.
 if has('nvim')
