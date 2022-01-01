@@ -11,36 +11,42 @@
     # set spacevim theme. by default colorscheme layer is not loaded,
     # if you want to use more colorscheme, please load the colorscheme
     # layer
-    colorscheme = "one"
-    colorscheme_bg = "light"
+    colorscheme = 'one'
+    colorscheme_bg = 'light'
     # Disable guicolors in basic mode, many terminal do not support 24bit
     # true colors
     enable_guicolors = true
     # Disable statusline separator, if you want to use other value, please
     # install nerd fonts
-    statusline_separator = "arrow"
-    statusline_iseparator = "arrow"
+    statusline_separator = 'arrow'
+    statusline_iseparator = 'arrow'
     buffer_index_type = 4
     enable_tabline_filetype_icon = true
     enable_statusline_mode = false
 
-    filetree_direction = "left"
-    relativenumber = "false"
+    filetree_direction = 'left'
+    relativenumber = 'false'
+    default_indent = 4
+    bootstrap_after = 'myspacevim#after'
 
 # Enable autocomplete layer
 [[layers]]
-name = "autocomplete"
-auto_completion_return_key_behavior = "complete"
-auto_completion_tab_key_behavior = "smart"
+name = 'autocomplete'
+auto_completion_return_key_behavior = 'complete'
+auto_completion_tab_key_behavior = 'smart'
 
 [[layers]]
-name = "shell"
-default_position = "top"
+name = 'shell'
+default_position = 'top'
 default_height = 30
 
 [[layers]]
-name = "colorscheme"
+name = 'colorscheme'
 
 [[layers]]
-name = "core"
+name = 'core'
 filetree_show_hidden = true
+
+[[layers]]
+name = 'format'
+format_on_save = true
