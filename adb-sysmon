@@ -1,0 +1,184 @@
+#!/bin/bash
+# Tablet power, thermal, CPU, memory and network snapshot over adb.
+# Meant for `watch -n2 charge-rate`: one adb round trip; rates (CPU %, network)
+# are deltas against the previous run, kept on the tablet in /data/local/tmp.
+# The battery current comes from pw.dex (~/.cache/charge-rate/Pw.java), run
+# with app_process since sysfs's power_supply is closed to the shell user.
+# `charge-rate N` is short for `watch -n N charge-rate`.
+
+if [[ $1 =~ ^[0-9]+$ ]]; then
+  exec watch -n "$1" "$(printf %q "$0")"
+fi
+
+dex=~/.cache/charge-rate/pw.dex
+adb shell '[ -f /data/local/tmp/pw.dex ]' || adb push "$dex" /data/local/tmp/pw.dex >/dev/null
+
+# The terminal's width decides whether the two TOP lists sit side by side
+# (watch sets COLUMNS; tput reads it straight from the terminal otherwise).
+cols=${COLUMNS:-$(tput cols 2>/dev/null)}
+
+# Passed as an argument, not on stdin: the jobs it runs would read stdin too.
+exec adb shell "COLS=${cols:-80}; $(cat <<'EOF'
+T=/data/local/tmp/charge-rate
+mkdir -p $T
+
+# The slow ones (app_process ~1.3s, top ~0.4s) run while the rest is read.
+CLASSPATH=/data/local/tmp/pw.dex app_process / Pw > $T/cur 2>/dev/null &
+top -b -n 1 -q -o PID,%CPU,RES,NAME -s 2 > $T/top 2>/dev/null &
+top -b -n 1 -q -o PID,%CPU,RES,NAME -s 3 > $T/topmem 2>/dev/null &
+
+# Every line is "  label  value", the label 12 wide.
+{
+# --- Thermal: sysfs zones (m°C) grouped by block, plus the framework's throttle status.
+throttle=$(dumpsys thermalservice 2>/dev/null | awk '
+  /^Thermal Status:/ { split("none light moderate severe critical emergency shutdown", s, " "); st = s[$3 + 1] }
+  /^Current temperatures from HAL/ { cur = 1; next }
+  cur && /mStatus=[1-9]/ { match($0, /mName=[^,]*/); hot = hot (hot ? ", " : "") substr($0, RSTART + 6, RLENGTH - 6) }
+  cur && !/Temperature/ { cur = 0 }
+  END { printf "%s%s", st, hot ? " (" hot ")" : "" }')
+grep -H . /sys/class/thermal/thermal_zone*/type /sys/class/thermal/thermal_zone*/temp 2>/dev/null |
+awk -F: -v throttle="$throttle" '
+  { split($1, p, "/"); z = p[5] }
+  $1 ~ /type$/ { type[z] = $2; next }
+  { temp[z] = $2 }
+  function grp(n) {
+    if (n ~ /^cpu-hw-trip/) return ""
+    if (n ~ /^cpu/) return "CPU"
+    if (n ~ /^gpuss/) return "GPU"
+    if (n ~ /^nsp/) return "NPU"
+    if (n == "ddr") return "Memory"
+    if (n ~ /^qmx/) return "SoC rails"
+    if (n ~ /^mdmss|^pa_|rfboard/) return "Modem/RF"
+    if (n ~ /^camera|^video/) return "Camera"
+    if (n ~ /^pm.*_tz$|^dcxo/) return "PMIC"
+    return ""
+  }
+  END {
+    for (z in type) {
+      n = type[z]; if (temp[z] == "") continue
+      t = temp[z] / 1000; one[n] = t
+      g = grp(n); if (g == "") continue
+      if (!(g in mx) || t > mx[g]) mx[g] = t
+      if (!(g in mn) || t < mn[g]) mn[g] = t
+    }
+    printf "THERMAL                     throttling: %s\n", throttle
+    split("CPU GPU NPU Memory SoC_rails Modem/RF Camera", order, " ")
+    for (i = 1; i in order; i++) {
+      g = order[i]; gsub(/_/, " ", g); if (!(g in mx)) continue
+      r = sprintf("%.0f", mn[g]); if (sprintf("%.0f", mx[g]) != r) r = r "-" sprintf("%.0f", mx[g])
+      printf "  %-12s%s °C\n", g, r
+    }
+    line = ""
+    split("hot_pock:hotspot system_h:inside lcd:screen shell_front:front shell_back:back shell_frame:frame", sk, " ")
+    for (i = 1; i in sk; i++) { split(sk[i], a, ":"); if (a[1] in one) line = line sprintf("%s %.0f   ", a[2], one[a[1]]) }
+    printf "  %-12s%s\n", "Surface", line
+    line = ""
+    split("charger:charger battery:battery usb_port:usb-port", ch, " ")
+    for (i = 1; i in ch; i++) { split(ch[i], a, ":"); if (a[1] in one) line = line sprintf("%s %.0f   ", a[2], one[a[1]]) }
+    if ("PMIC" in mx) line = line sprintf("PMIC %.0f", mx["PMIC"])
+    printf "  %-12s%s\n", "Charging", line
+  }'
+echo
+
+# --- CPU: each cluster's cores' use since the last run, its clock and its cap.
+grep -H . /sys/devices/system/cpu/cpufreq/policy*/related_cpus /sys/devices/system/cpu/cpufreq/policy*/scaling_cur_freq \
+  /sys/devices/system/cpu/cpufreq/policy*/scaling_max_freq /sys/devices/system/cpu/cpufreq/policy*/cpuinfo_max_freq > $T/freq 2>/dev/null
+awk -v prev=$T/stat '
+  BEGIN { while ((getline l < prev) > 0) { split(l, f, " "); pt[f[1]] = f[2]; pi[f[1]] = f[3]; had = 1 } }
+  FILENAME !~ /stat$/ { split($0, p, "/"); split($0, v, ":"); sub(/:.*/, "", p[8]); pol[p[7]] = 1; val[p[7], p[8]] = v[2]; next }
+  /^cpu/ {
+    t = 0; for (i = 2; i <= NF; i++) t += $i; idle = $5 + $6
+    print $1, t, idle > (prev ".new")
+    dt = t - pt[$1]; di = idle - pi[$1]; u[$1] = dt > 0 ? 100 * (dt - di) / dt : 0
+  }
+  END {
+    getline la < "/proc/loadavg"; split(la, L, " ")
+    printf "CPU           %.0f%%%s       load %s / %s / %s\n", u["cpu"], had ? "" : " since boot", L[1], L[2], L[3]
+    for (q in pol) order[substr(q, 7) + 0] = q
+    for (i = 0; i < 64; i++) {
+      if (!(i in order)) continue; q = order[i]
+      nc = split(val[q, "related_cpus"], c, " "); line = ""
+      for (j = 1; j <= nc; j++) line = line sprintf("%4.0f%%", u["cpu" c[j]])
+      cap = val[q, "scaling_max_freq"] < val[q, "cpuinfo_max_freq"] ? sprintf(", capped at %.2f", val[q, "scaling_max_freq"] / 1e6) : ""
+      printf "  %-12s%-32s %.2f of %.2f GHz%s\n", "cpu" c[1] "-" c[nc], line,
+        val[q, "scaling_cur_freq"] / 1e6, val[q, "cpuinfo_max_freq"] / 1e6, cap
+    }
+  }' $T/freq /proc/stat
+mv $T/stat.new $T/stat
+echo
+
+# --- Memory, display, network.
+awk '/^(MemTotal|MemAvailable|SwapTotal|SwapFree):/ { m[$1] = $2 / 1048576 }
+  END { printf "MEMORY        %.1f of %.1f GB free, swap %.1f of %.1f GB used\n",
+    m["MemAvailable:"], m["MemTotal:"], m["SwapTotal:"] - m["SwapFree:"], m["SwapTotal:"] }' /proc/meminfo
+printf 'DISPLAY       brightness %s\n' "$(settings get system screen_brightness)"
+awk -v prev=$T/net '
+  BEGIN { while ((getline l < prev) > 0) { split(l, f, " "); pr[f[1]] = f[2]; ptx[f[1]] = f[3]; pts = f[4] }
+          getline up < "/proc/uptime"; split(up, U, " "); now = U[1] }
+  /:/ { sub(/:/, " "); if ($1 ~ /^(lo|dummy|ip6|sit|ifb|bond)/ || $2 == 0) next
+        print $1, $2, $10, now > (prev ".new")
+        if (pts && now > pts && ($1 in pr))
+          line = line sprintf("%s rx %.0f tx %.0f kB/s   ", $1, ($2 - pr[$1]) / 1024 / (now - pts), ($10 - ptx[$1]) / 1024 / (now - pts)) }
+  END { print "NETWORK       " (line ? line : "(rates from the next run)") }' /proc/net/dev
+mv $T/net.new $T/net
+} > $T/out
+
+# --- Power: printed first, once the battery current is in.
+wait
+dumpsys battery | awk -v cur="$(cat $T/cur)" -v avg=$T/avg '
+  /^ *Charge counter:/ { cc = $3 }
+  /^ *Max charging current:/ { mi = $4 } /^ *Max charging voltage:/ { mv = $4 }
+  /^ *level:/ { lvl = $2 } /^ *voltage:/ { v = $2 } /^ *temperature:/ { t = $2 / 10 }
+  /^ *AC powered: true/ { src = src "/AC" } /^ *USB powered: true/ { src = src "/USB" }
+  /^ *Wireless powered: true/ { src = src "/wireless" }
+  /^ *status:/ { split("? unknown charging discharging not-charging full", s, " "); st = s[$2 + 1] }
+  END {
+    ma = (cur > 30000 || cur < -30000) ? cur / 1000 : cur   # this driver reports mA; others uA
+    w = ma * v / 1e6
+    print "POWER"
+    printf "  %-12s%d%%, %s, %.2f V, %.0f °C\n", "Battery", lvl, st, v / 1000, t
+    if (w >= 0) what = "charging the battery"
+    else if (src != "") what = "draining: load exceeds charging"
+    else what = "system draw"
+    printf "  %-12s%+.1f W %s (%+d mA)\n", "Flow", w, what, ma
+    # Time left from the charge counter (mAh here, uAh on other drivers) at the
+    # current averaged over the last ~10 s of runs, reset when the flow turns.
+    getline pa < avg; close(avg)
+    a = (pa != "" && pa * ma > 0) ? 0.8 * pa + 0.2 * ma : ma
+    print a > avg
+    mah = cc > 100000 ? cc / 1000 : cc
+    if (mah > 0 && lvl > 0 && (a > 20 || a < -20)) {
+      if (a < 0) { h = mah / -a; to = "to empty" }
+      else { h = (mah * 100 / lvl - mah) / a; to = "to full (less as charging tapers)" }
+      printf "  %-12s%dh %02dm %s at %+.0f mA, %.0f of %.0f mAh\n", "Remaining", h, (h - int(h)) * 60, to, a, mah, mah * 100 / lvl
+    }
+    if (src != "") printf "  %-12sup to %.1f W (%.1f A x %.2f V, %s)\n", "Charger", mi * mv / 1e12, mi / 1e6, mv / 1e6, substr(src, 2)
+    else printf "  %-12snone\n", "Charger"
+  }'
+echo
+cat $T/out
+echo
+# --- TOP: by CPU and by memory, side by side when the terminal is wide enough.
+for f in top topmem; do grep -vE ' (top|sh|awk|grep|app_process)$' $T/$f | head -8 > $T/$f.8; done
+awk -v cols=$COLS '
+  function row(l,   f, n) {
+    n = split(l, f, " "); name = f[4]; for (i = 5; i <= n; i++) name = name " " f[i]
+    sub(/:sandboxed_process.*/, " (renderer)", name)
+    if (length(name) > nw) name = substr(name, 1, nw - 1) "~"
+    return sprintf("  %-7s%5s %5s  %s", f[1], f[2], f[3], name)
+  }
+  BEGIN { side = cols >= 100; w = side ? int((cols - 2) / 2) : cols; nw = w - 22; if (nw > 50) nw = 50 }
+  FILENAME ~ /topmem/ { m[++nm] = row($0); next }
+  { c[++nc] = row($0) }
+  END {
+    hc = sprintf("  %-7s%5s %5s  %s", "PID", "%CPU", "MEM", "PROCESS")
+    if (side) {
+      printf "%-*s%s\n%-*s%s\n", w, "TOP BY CPU", "TOP BY MEMORY", w, hc, hc
+      for (i = 1; i <= nc || i <= nm; i++) printf "%-*s%s\n", w, c[i], m[i]
+    } else {
+      print "TOP BY CPU"; print hc; for (i = 1; i <= nc; i++) print c[i]
+      print ""; print "TOP BY MEMORY"; print hc; for (i = 1; i <= nm; i++) print m[i]
+    }
+  }' $T/top.8 $T/topmem.8
+EOF
+)"
