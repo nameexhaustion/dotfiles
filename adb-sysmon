@@ -68,13 +68,29 @@ snapshot() {
     export H= W= A= D= N=
   fi
   # Layout shared by every section: headings and labels in a 14-column gutter.
-  export LIB='
-    function head(name, rest) { printf "%s%-14s%s%s\n", ENVIRON["H"], name, ENVIRON["N"], rest }
-    function row(label, rest) { if (rest != "") printf "  %-12s%s\n", label, rest }
+  # A value too long for the terminal goes on under the gutter, broken only at
+  # the "\001"s in it (spaces at the break dropped).
+  export COLS LIB='
+    function head(name, rest) { fit(ENVIRON["H"] sprintf("%-14s", name) ENVIRON["N"], rest) }
+    function row(label, rest) { if (rest != "") fit(sprintf("  %-12s", label), rest) }
+    function fit(lead, rest,   p, n, i, line, piece, cols) {
+      cols = ENVIRON["COLS"] + 0; if (cols < 20) cols = 80
+      n = split(rest, p, "\001"); line = lead p[1]
+      for (i = 2; i <= n; i++) {
+        piece = p[i]
+        if (shown(line piece) <= cols) { line = line piece; continue }
+        sub(/ +$/, "", line); print line
+        sub(/^ +/, "", piece); line = sprintf("%14s", "") piece
+      }
+      print line
+    }
+    # Columns on screen: no colour codes, and a UTF-8 character (°) as one
+    # though awk counts its bytes.
+    function shown(s) { gsub(/\033\[[0-9;]*m/, "", s); gsub(/[\200-\277]/, "", s); return length(s) }
     function warn(s) { return ENVIRON["W"] s ENVIRON["N"] }
     function alarm(s) { return ENVIRON["A"] s ENVIRON["N"] }
     function dim(s) { return ENVIRON["D"] s ENVIRON["N"] }
-    function join(a, n,   s, i) { for (i = 1; i <= n; i++) s = s (i > 1 ? "   " : "") a[i]; return s }
+    function join(a, n,   s, i) { for (i = 1; i <= n; i++) s = s (i > 1 ? "   \001" : "") a[i]; return s }
   '
 
   # The slow ones (app_process ~1.3 s, top ~0.4 s each) run while the rest is read.
@@ -135,7 +151,7 @@ snapshot() {
       }
       row("Surface", pairs("hot_pock:hotspot system_h:inside lcd:screen shell_front:front shell_back:back shell_frame:frame"))
       s = pairs("charger:charger battery:battery usb_port:usb-port")
-      if ("PMIC" in mx) s = s (s != "" ? "   " : "") "PMIC " deg(mx["PMIC"], 1)
+      if ("PMIC" in mx) s = s (s != "" ? "   \001" : "") "PMIC " deg(mx["PMIC"], 1)
       row("Charging", s)
     }'
   echo
@@ -161,7 +177,7 @@ snapshot() {
     }
     END {
       getline la < "/proc/loadavg"; split(la, L, " ")
-      head("CPU", sprintf("%.0f%% busy%s   load %s / %s / %s", u["cpu"], had ? "" : " since boot", L[1], L[2], L[3]))
+      head("CPU", sprintf("%.0f%% busy%s   \001load %s / %s / %s", u["cpu"], had ? "" : " since boot", L[1], L[2], L[3]))
       for (q in pol) order[substr(q, 7) + 0] = q
       for (i = 0; i < 64; i++) {
         if (!(i in order)) continue; q = order[i]
@@ -176,10 +192,10 @@ snapshot() {
         cells = cells sprintf("%*s", 32 - 5 * nc, "")    # not %-32s: that would count the colour codes
         cur = val[q, "scaling_cur_freq"] / 1e6; hw = val[q, "cpuinfo_max_freq"] / 1e6; cap = val[q, "scaling_max_freq"] / 1e6
         s = sprintf("%.2f of %.2f GHz", cur, hw)
-        if (cap < hw) s = s ", " warn(sprintf("capped at %.2f", cap))
-        if (np) s = s ", " warn(np == nc ? "all parked" : np " parked")
-        if (npart) s = s ", " warn(npart " partly parked")
-        row("cpu" c[1] "-" c[nc], cells " " s)
+        if (cap < hw) s = s ",\001 " warn(sprintf("capped at %.2f", cap))
+        if (np) s = s ",\001 " warn(np == nc ? "all parked" : np " parked")
+        if (npart) s = s ",\001 " warn(npart " partly parked")
+        row("cpu" c[1] "-" c[nc], cells " \001" s)
       }
     }' freq park /proc/stat
   mv $S/stat.new $S/stat
@@ -190,7 +206,7 @@ snapshot() {
     /^(MemTotal|MemAvailable|SwapTotal|SwapFree):/ { m[$1] = $2 / 1048576 }
     END {
       free = sprintf("%.1f", m["MemAvailable:"])
-      head("MEMORY", (m["MemAvailable:"] < 1 ? warn(free) : free) sprintf(" of %.1f GB free   swap %.1f of %.1f GB used",
+      head("MEMORY", (m["MemAvailable:"] < 1 ? warn(free) : free) sprintf(" of %.1f GB free   \001swap %.1f of %.1f GB used",
         m["MemTotal:"], m["SwapTotal:"] - m["SwapFree:"], m["SwapTotal:"]))
     }' /proc/meminfo
   awk -v b="$(settings get system screen_brightness)" "$LIB"'BEGIN { head("DISPLAY", "brightness " b) }'
@@ -222,7 +238,7 @@ snapshot() {
       # uA and uAh (as Android documents), or mA and mAh (as some vendors do).
       micro = cc > 100000
       mah = micro ? cc / 1000 : cc
-      if (cur !~ /^-?[0-9]+$/) row("Flow", warn("current unavailable") dim(dex == "none" ? " (no pw.dex)" : " (pw.dex gave nothing)"))
+      if (cur !~ /^-?[0-9]+$/) row("Flow", warn("current unavailable") " \001" dim(dex == "none" ? "(no pw.dex)" : "(pw.dex gave nothing)"))
       else {
         ma = micro ? cur / 1000 : cur
         w = ma * v / 1e6
@@ -230,7 +246,7 @@ snapshot() {
         else if (ma >= -20) what = "idle"
         else if (src != "") what = warn("draining: load exceeds charging")
         else what = "system draw"
-        row("Flow", sprintf("%+.1f W ", w) what dim(sprintf(" (%+d mA)", ma)))
+        row("Flow", sprintf("%+.1f W ", w) what " \001" dim(sprintf("(%+d mA)", ma)))
         # Time left from the charge counter at the current averaged over the
         # last ~10 s of snapshots, reset when the flow turns.
         getline pa < avg; close(avg)
@@ -239,10 +255,10 @@ snapshot() {
         if (mah > 0 && lvl > 0 && (a > 20 || a < -20)) {
           if (a < 0) { h = mah / -a; to = "to empty" }
           else { h = (mah * 100 / lvl - mah) / a; to = "to full (less as charging tapers)" }
-          row("Remaining", sprintf("%dh %02dm %s ", h, (h - int(h)) * 60, to) dim(sprintf("at %+.0f mA, %.0f of %.0f mAh", a, mah, mah * 100 / lvl)))
+          row("Remaining", sprintf("%dh %02dm %s \001", h, (h - int(h)) * 60, to) dim(sprintf("at %+.0f mA, %.0f of %.0f mAh", a, mah, mah * 100 / lvl)))
         }
       }
-      if (src != "") row("Charger", sprintf("up to %.1f W (%.1f A x %.2f V, %s)", mi * mv / 1e12, mi / 1e6, mv / 1e6, substr(src, 2)))
+      if (src != "") row("Charger", sprintf("up to %.1f W \001(%.1f A x %.2f V, %s)", mi * mv / 1e12, mi / 1e6, mv / 1e6, substr(src, 2)))
       else row("Charger", dim("none"))
     }'
   echo
