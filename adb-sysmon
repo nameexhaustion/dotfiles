@@ -2,8 +2,7 @@
 # sysmon: an Android device's power, thermal, CPU, GPU, memory and network at a glance, over adb.
 #
 #   sysmon       one snapshot
-#   sysmon N     refresh every N seconds (watch -n N), under a line giving
-#                the interval, how long the snapshot took and its time
+#   sysmon N     refresh every N seconds (watch -n N)
 #
 # Colour goes to a terminal and to `sysmon N`; NO_COLOR=1 turns it off and
 # SYSMON_COLOR=1 or 0 forces it either way.
@@ -22,9 +21,8 @@
 
 if [[ $1 =~ ^[0-9]+$ ]]; then
   export SYSMON_ID=$$    # exec keeps the pid: watch's, for every snapshot it runs
-  export SYSMON_EVERY=$1  # watch -t drops its own header; we print ours
   [[ -z $NO_COLOR ]] && export SYSMON_COLOR=${SYSMON_COLOR:-1}
-  exec watch -c -t -n "$1" "$(printf %q "$0")"
+  exec watch -c -n "$1" "$(printf %q "$0")"
 fi
 
 T=/data/local/tmp/sysmon
@@ -303,29 +301,11 @@ snapshot 9> $S/lock
 EOF
 )"
 
-run() {
-  adb shell "$script"
-  status=$?
-  if (( status == 3 )); then   # the device's pw.dex is missing or stale
-    adb shell "mkdir -p $T" && adb push "$dex" $T/pw.dex >/dev/null && adb shell "$script"
-    status=$?
-  fi
-  return $status
-}
-
-[[ -z $SYSMON_EVERY ]] && { run; exit; }
-
-# Under watch: the header line first, so the snapshot is read before it's
-# printed. watch waits N seconds after each one ends, so a refresh comes every
-# N seconds plus the snapshot's own time.
-start=$(date +%s%N)
-out=$(run)
+adb shell "$script"
 status=$?
-took=$(( ($(date +%s%N) - start) / 1000000 ))
-[[ $color = 1 ]] && { d=$'\e[2m'; n=$'\e[0m'; }
-printf '%severy %ss + %d.%01ds to read, so every %d.%01ds   %s%s\n\n' "$d" "$SYSMON_EVERY" \
-  $((took / 1000)) $((took % 1000 / 100)) $(((SYSMON_EVERY * 1000 + took) / 1000)) $(((SYSMON_EVERY * 1000 + took) % 1000 / 100)) \
-  "$(date +%H:%M:%S)" "$n"
-printf '%s\n' "$out"
+if (( status == 3 )); then   # the device's pw.dex is missing or stale
+  adb shell "mkdir -p $T" && adb push "$dex" $T/pw.dex >/dev/null && adb shell "$script"
+  status=$?
+fi
 exit $status
 
