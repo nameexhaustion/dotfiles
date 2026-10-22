@@ -1,5 +1,5 @@
 #!/bin/bash
-# sysmon: an Android device's power, thermal, CPU, memory and network at a glance, over adb.
+# sysmon: an Android device's power, thermal, CPU, GPU, memory and network at a glance, over adb.
 #
 #   sysmon       one snapshot
 #   sysmon N     refresh every N seconds (watch -n N)
@@ -16,7 +16,7 @@
 # sysfs's power_supply is closed to the shell user; without it the rest still works.
 #
 # Generic Android (toybox, mksh, dumpsys) except where noted: the thermal zone
-# names and core_ctl's parked cores are Qualcomm's, and the surface sensors are
+# names, core_ctl's parked cores and the GPU's kgsl are Qualcomm's, and the surface sensors are
 # one vendor's. Whatever a device lacks is left out.
 
 if [[ $1 =~ ^[0-9]+$ ]]; then
@@ -200,6 +200,13 @@ snapshot() {
     }' freq park /proc/stat
   mv $S/stat.new $S/stat
   echo
+
+  # --- GPU: busy over the driver's last ~1 s window, busy and total in us (both
+  # 0 when it was idle throughout). Not since the last snapshot, and the clock
+  # is closed to the shell user.
+  awk "$LIB"'
+    NF == 2 { u = $2 > 0 ? 100 * $1 / $2 : 0; s = sprintf("%.0f%%", u)
+              head("GPU", (u >= 90 ? ENVIRON["H"] s ENVIRON["N"] : s) " busy " dim("(last second)")) }' /sys/class/kgsl/kgsl-3d0/gpubusy 2>/dev/null
 
   # --- MEMORY, DISPLAY, NETWORK: a line each.
   awk "$LIB"'
