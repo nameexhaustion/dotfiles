@@ -285,3 +285,4 @@ if (( status == 3 )); then   # the device's pw.dex is missing or stale
   status=$?
 fi
 exit $status
+
