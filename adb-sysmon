@@ -21,12 +21,26 @@
 # names, core_ctl's parked cores and the GPU's kgsl are Qualcomm's, and the surface sensors are
 # one vendor's. Whatever a device lacks is left out.
 
+# What it's doing while the terminal would otherwise sit blank: one dim line on
+# stderr, cleared once there's something else to show. Not under `sysmon N`:
+# watch shows only stdout, and there the last snapshot stays up meanwhile.
+if [[ -t 2 && -z $SYSMON_ID ]]; then
+  say() { printf '\r\e[2m%s\e[0m\e[K' "$*" >&2; }
+  unsay() { printf '\r\e[K' >&2; }
+else
+  say() { :; }; unsay() { :; }
+fi
+
 # More than one device: pick one with the arrow keys and Enter (q or Esc quits).
 # It's passed on in ANDROID_SERIAL, which adb reads, so every snapshot of
-# `sysmon N` uses it; set ANDROID_SERIAL yourself to skip the question.
+# `sysmon N` uses it; set ANDROID_SERIAL yourself to skip the question. The
+# only one gets it too: adb itself would refuse to choose when an unauthorized
+# or offline device is attached as well.
 if [[ -z $ANDROID_SERIAL ]]; then
+  say "Looking for devices…"
   mapfile -t serials < <(adb devices 2>/dev/null | awk 'NR > 1 && $2 == "device" { print $1 }')
   n=${#serials[@]}
+  (( n == 1 )) && export ANDROID_SERIAL=${serials[0]}
   if (( n > 1 )); then
     if [[ ! -t 0 || ! -t 2 ]]; then
       echo "sysmon: $n devices attached; set ANDROID_SERIAL to one of them" >&2
@@ -34,7 +48,9 @@ if [[ -z $ANDROID_SERIAL ]]; then
     fi
     # Each device's name (Settings → About), its marketing name and its model,
     # asked of all of them at once.
+    say "Asking the $n devices who they are…"
     tmp=$(mktemp -d)
+    trap 'rm -rf "$tmp"; unsay' EXIT
     for i in "${!serials[@]}"; do
       timeout 3 adb -s "${serials[i]}" shell 'settings get global device_name; getprop ro.config.marketing_name;
         echo "$(getprop ro.product.manufacturer) $(getprop ro.product.model)"; getprop ro.product.model' > "$tmp/$i" 2>/dev/null &
@@ -49,6 +65,7 @@ if [[ -z $ANDROID_SERIAL ]]; then
       names[i]=${name:-${market:-${serials[i]}}} markets[i]=$market models[i]=$model
     done
     rm -rf "$tmp"
+    unsay
 
     # Columns padded by what they take on screen (wc -L): 荣耀 is two columns a character.
     width() { printf %s "$1" | wc -L; }
@@ -87,7 +104,7 @@ if [[ -z $ANDROID_SERIAL ]]; then
     printf '\e[%dA\e[J' $(( n + 2 )) >&2    # the DEVICE line says which it was
     tput cnorm >&2
     trap - EXIT
-    export ANDROID_SERIAL=${serials[sel]}
+    export ANDROID_SERIAL=${serials[sel]} label=${names[sel]}
   fi
 fi
 
@@ -114,7 +131,6 @@ cols=${COLUMNS:-$(tput cols 2>/dev/null)}
 dexsum=none
 [[ -f $dex ]] && dexsum=$(md5sum < "$dex" | cut -d' ' -f1)
 
-# Passed as an argument, not on stdin: the jobs it runs would read stdin too.
 # The serial the DEVICE line shows (the device's own when adb picked the only one).
 serial=${ANDROID_SERIAL:-$(adb get-serialno 2>/dev/null)}
 
@@ -122,6 +138,18 @@ serial=${ANDROID_SERIAL:-$(adb get-serialno 2>/dev/null)}
 script="T=$T; ID=${SYSMON_ID:-once}; DEX=$dexsum; COLS=${cols:-80}; COLOR=$color; SERIAL=$(printf %q "$serial"); $(cat <<'EOF'
 # Exit 3, before printing anything, when the device's pw.dex isn't ours.
 [ $DEX = none ] || [ "$(md5sum $T/pw.dex 2>/dev/null | cut -d' ' -f1)" = $DEX ] || exit 3
+
+# adbd lets a command run on when its client goes away, so the snapshot ends
+# itself: after 15 s (it takes ~1.5) whatever's still running of it, a hung
+# service call or a wait on another snapshot's lock, gets TERM (the shell's
+# trap clears its files) and a second later KILL. Sent to the process group,
+# which is just the snapshot's: adbd starts the shell as a group of its own.
+# A snapshot that finishes stops it. Off adbd's pipe, so it holds nothing open.
+# (exec, not a redirection on the subshell: mksh would keep adbd's fds as 10-12.)
+( exec < /dev/null > /dev/null 2>&1
+  trap 'kill $s; exit' TERM; sleep 15 & s=$!; wait $s
+  trap '' TERM; kill -TERM 0; sleep 1; kill -KILL 0 ) &
+WD=$!
 
 # This snapshot's own files go in R; the baselines in S, held under S's lock
 # for the whole snapshot. The lock comes in on a redirection to snapshot: an
@@ -132,8 +160,10 @@ mkdir -p $S
 snapshot() {
   flock 9
   R=$(mktemp -d $T/run.XXXXXX)
-  trap 'rm -rf $R' EXIT
-  trap 'exit 1' HUP INT TERM
+  # mksh exits with the EXIT trap's last status, so it's kept by hand: a
+  # snapshot the watchdog stopped ends 1, not 0.
+  trap 'st=${st:-$?}; rm -rf $R; kill $WD 2>/dev/null; exit $st' EXIT
+  trap 'st=1; exit 1' HUP INT TERM
   cd $R
   find $T -maxdepth 1 \( -name 'run.*' -o -name 'state.*' \) -mmin +1440 -exec rm -rf {} + 2>/dev/null
 
@@ -169,10 +199,14 @@ snapshot() {
     function join(a, n,   s, i) { for (i = 1; i <= n; i++) s = s (i > 1 ? "   \001" : "") a[i]; return s }
   '
 
-  # The slow ones (app_process ~1.3 s, top ~0.4 s each) run while the rest is read.
+  # The slow ones (app_process ~1.3 s, top ~0.4 s each) run while the rest is
+  # read. Waited for by pid: a bare wait would sit out the watchdog too.
   [ $DEX = none ] || CLASSPATH=$T/pw.dex app_process / Pw > cur 2>/dev/null &
+  jobs=$!
   top -b -n 1 -q -o PID,%CPU,RES,NAME -s 2 > top 2>/dev/null &
+  jobs="$jobs $!"
   top -b -n 1 -q -o PID,%CPU,RES,NAME -s 3 > topmem 2>/dev/null &
+  jobs="$jobs $!"
 
   {
   # --- THERMAL: sysfs zones (m°C) grouped by block, and the framework's throttling status.
@@ -306,7 +340,7 @@ snapshot() {
   } > out
 
   # --- DEVICE: whose stats these are. Then POWER, once the battery current is in.
-  wait
+  wait $jobs
   # Its name (Settings → About), its marketing name (Honor's; the maker's
   # otherwise), its model, Android release and adb serial.
   market=$(getprop ro.config.marketing_name)
@@ -386,14 +420,25 @@ snapshot() {
     }' top.8 topmem.8 | sed 's/ *$//'
 }
 snapshot 9> $S/lock
+st=$?; kill $WD 2>/dev/null; exit $st
 EOF
 )"
 
-adb shell "$script"
+# Held back until it's all in, so the status line can make way for it in one go
+# (errors too: they'd land on the status line). -n: what's typed stays here.
+err=$(mktemp)
+trap 'rm -f "$err"; unsay' EXIT
+say "Connecting to ${label:-${serial:-the device}}…"
+out=$(adb shell -n "$script" 2> "$err")
 status=$?
 if (( status == 3 )); then   # the device's pw.dex is missing or stale
-  adb shell "mkdir -p $T" && adb push "$dex" $T/pw.dex >/dev/null && adb shell "$script"
+  say "Copying pw.dex to ${label:-${serial:-the device}}…"
+  adb shell -n "mkdir -p $T" 2> "$err" && adb push "$dex" $T/pw.dex > /dev/null 2> "$err" &&
+    out=$(adb shell -n "$script" 2> "$err")
   status=$?
 fi
+unsay
+[[ -n $out ]] && printf '%s\n' "$out"
+cat "$err" >&2
 exit $status
 
