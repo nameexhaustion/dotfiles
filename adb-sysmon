@@ -2,7 +2,7 @@
 # sysmon: an Android device's power, thermal, CPU, GPU, memory and network at a glance, over adb.
 #
 #   sysmon       one snapshot
-#   sysmon N     refresh every N seconds (watch -n N)
+#   sysmon N     refresh every N seconds, full screen like watch
 #
 # With more than one device attached it asks which (ANDROID_SERIAL skips that).
 #
@@ -22,8 +22,8 @@
 # one vendor's. Whatever a device lacks is left out.
 
 # What it's doing while the terminal would otherwise sit blank: one dim line on
-# stderr, cleared once there's something else to show. Not under `sysmon N`:
-# watch shows only stdout, and there the last snapshot stays up meanwhile.
+# stderr, cleared once there's something else to show. Not for the snapshots
+# of `sysmon N`, whose header says instead.
 if [[ -t 2 && -z $SYSMON_ID ]]; then
   say() { printf '\r\e[2m%s\e[0m\e[K' "$*" >&2; }
   unsay() { printf '\r\e[K' >&2; }
@@ -41,6 +41,7 @@ if [[ -z $ANDROID_SERIAL ]]; then
   mapfile -t serials < <(adb devices 2>/dev/null | awk 'NR > 1 && $2 == "device" { print $1 }')
   n=${#serials[@]}
   (( n == 1 )) && export ANDROID_SERIAL=${serials[0]}
+  unsay
   if (( n > 1 )); then
     if [[ ! -t 0 || ! -t 2 ]]; then
       echo "sysmon: $n devices attached; set ANDROID_SERIAL to one of them" >&2
@@ -108,10 +109,35 @@ if [[ -z $ANDROID_SERIAL ]]; then
   fi
 fi
 
+# `sysmon N`: a snapshot every N seconds, each run as `sysmon` and drawn over the
+# last once it's all in, so the screen never sits blank: "Connecting to …"
+# until the first, then the last one with its time, and "updating…" in the
+# header while the next is fetched. On the alternate screen, like watch.
 if [[ $1 =~ ^[0-9]+$ ]]; then
-  export SYSMON_ID=$$    # exec keeps the pid: watch's, for every snapshot it runs
+  export SYSMON_ID=$$    # the snapshots' baseline on the device, one per `sysmon N`
   [[ -z $NO_COLOR ]] && export SYSMON_COLOR=${SYSMON_COLOR:-1}
-  exec watch -c -n "$1" "$(printf %q "$0")"
+  if [[ ! -t 1 ]]; then
+    while :; do "$0"; echo; sleep "$1"; done
+  fi
+  dim= off=
+  [[ $SYSMON_COLOR == 1 ]] && dim=$'\e[2m' off=$'\e[0m'
+  title="sysmon · ${label:-${ANDROID_SERIAL:-the device}} · every $1 s"
+  header() { printf '\e[H%s%s%s\e[K' "$dim" "$title${1:+ · $1}" "$off"; }
+  # Keys typed meanwhile aren't echoed into the frame (watch's curses does the same).
+  tty=$(stty -g)
+  tput smcup; tput civis; stty -echo
+  trap 'stty "$tty"; tput cnorm; tput rmcup' EXIT
+  trap 'exit 130' INT TERM HUP
+  printf '\e[H\e[J'; header; printf '\n\n%sConnecting to %s…%s' "$dim" "${label:-${ANDROID_SERIAL:-the device}}" "$off"
+  while :; do
+    out=$(COLUMNS=$(tput cols) "$0" 2>&1)
+    at=$(date +%T)
+    # Cut to the screen (two lines go to the header), each line clearing what
+    # the last frame left after it.
+    header "$at"; printf '\n\n%s\e[J' "$(head -n $(( $(tput lines) - 2 )) <<< "$out" | sed $'s/$/\e[K/')"
+    sleep "$1"
+    header "$at · updating…"
+  done
 fi
 
 T=/data/local/tmp/sysmon
@@ -124,7 +150,7 @@ else color=0
 fi
 
 # The terminal's width decides whether the two TOP lists sit side by side
-# (watch sets COLUMNS; tput reads it straight from the terminal otherwise).
+# (`sysmon N` sets COLUMNS; tput reads it straight from the terminal otherwise).
 cols=${COLUMNS:-$(tput cols 2>/dev/null)}
 
 # pw.dex's checksum, so a stale copy on the device gets replaced ("none": no current).
