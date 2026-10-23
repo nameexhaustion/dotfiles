@@ -126,34 +126,38 @@ if [[ $1 =~ ^[0-9]+$ ]]; then
   title="sysmon · ${label:-${ANDROID_SERIAL:-the device}} · every $1 s"
   [[ -t 0 ]] && title+=" · q quits"
   header() { printf '\e[H%s%s%s\e[K' "$dim" "$title${1:+ · $1}" "$off"; }
-  # Waits $1 s (fractions too), or less if q or Q, which quits, is pressed;
-  # other keys are dropped. Off a terminal, a sleep.
-  now() { local t=${EPOCHREALTIME//[!0-9]/}; echo $(( 10#$t )); }    # microseconds
-  pause() {
-    [[ -t 0 ]] || { sleep "$1"; return; }
-    local s=${1%.*} f=${1#*.}; [[ $1 == *.* ]] || f=
-    f=${f}000000; local end=$(( $(now) + 10#${s:-0} * 1000000 + 10#${f:0:6} )) left k
-    while (( (left = end - $(now)) > 0 )); do
-      IFS= read -rsn1 -t "$(( left / 1000000 )).$(printf %06d $(( left % 1000000 )))" k && [[ $k == [qQ] ]] && exit 0
+  # Waits for job $1, or quits on q or Q (other keys are dropped). Keys are
+  # read by a job of their own, from fd 3, the terminal (a job's stdin is
+  # /dev/null), so it sleeps in wait -n till one or the other ends: nothing polls.
+  [[ -t 0 ]] && exec 3<&0
+  keys=
+  waitq() {
+    [[ -t 0 ]] || { wait "$1"; return; }
+    local who st
+    while :; do
+      if [[ -z $keys ]]; then { IFS= read -rsn1 k <&3; [[ $k == [qQ] ]]; } & keys=$!; fi
+      wait -n -p who "$1" $keys; st=$?
+      [[ $who == "$1" ]] && return
+      keys=; (( st == 0 )) && exit 0
     done
   }
   # Keys typed meanwhile aren't echoed into the frame (watch's curses does the same).
   tty=$(stty -g)
   frame=$(mktemp)
   tput smcup; tput civis; stty -echo
-  trap 'rm -f "$frame"; stty "$tty"; tput cnorm; tput rmcup' EXIT
+  trap 'kill $keys $nap 2>/dev/null; rm -f "$frame"; stty "$tty"; tput cnorm; tput rmcup' EXIT
   trap 'exit 130' INT TERM HUP
   printf '\e[H\e[J'; header; printf '\n\n%sConnecting to %s…%s' "$dim" "${label:-${ANDROID_SERIAL:-the device}}" "$off"
   while :; do
     COLUMNS=$(tput cols) "$0" < /dev/null > "$frame" 2>&1 &
-    fetch=$!
-    while kill -0 $fetch 2>/dev/null; do pause 0.1; done
+    waitq $!
     out=$(< "$frame")
     at=$(date +%T)
     # Cut to the screen (two lines go to the header), each line clearing what
     # the last frame left after it.
     header "$at"; printf '\n\n%s\e[J' "$(head -n $(( $(tput lines) - 2 )) <<< "$out" | sed $'s/$/\e[K/')"
-    pause "$1"
+    sleep "$1" &
+    nap=$!; waitq $nap; nap=
     header "$at · updating…"
   done
 fi
