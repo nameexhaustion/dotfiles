@@ -4,6 +4,8 @@
 #   sysmon       one snapshot
 #   sysmon N     refresh every N seconds (watch -n N)
 #
+# With more than one device attached it asks which (ANDROID_SERIAL skips that).
+#
 # Colour goes to a terminal and to `sysmon N`; NO_COLOR=1 turns it off and
 # SYSMON_COLOR=1 or 0 forces it either way.
 #
@@ -18,6 +20,76 @@
 # Generic Android (toybox, mksh, dumpsys) except where noted: the thermal zone
 # names, core_ctl's parked cores and the GPU's kgsl are Qualcomm's, and the surface sensors are
 # one vendor's. Whatever a device lacks is left out.
+
+# More than one device: pick one with the arrow keys and Enter (q or Esc quits).
+# It's passed on in ANDROID_SERIAL, which adb reads, so every snapshot of
+# `sysmon N` uses it; set ANDROID_SERIAL yourself to skip the question.
+if [[ -z $ANDROID_SERIAL ]]; then
+  mapfile -t serials < <(adb devices 2>/dev/null | awk 'NR > 1 && $2 == "device" { print $1 }')
+  n=${#serials[@]}
+  if (( n > 1 )); then
+    if [[ ! -t 0 || ! -t 2 ]]; then
+      echo "sysmon: $n devices attached; set ANDROID_SERIAL to one of them" >&2
+      exit 1
+    fi
+    # Each device's name (Settings → About), its marketing name and its model,
+    # asked of all of them at once.
+    tmp=$(mktemp -d)
+    for i in "${!serials[@]}"; do
+      timeout 3 adb -s "${serials[i]}" shell 'settings get global device_name; getprop ro.config.marketing_name;
+        echo "$(getprop ro.product.manufacturer) $(getprop ro.product.model)"; getprop ro.product.model' > "$tmp/$i" 2>/dev/null &
+    done
+    wait
+    names=() markets=() models=()
+    for i in "${!serials[@]}"; do
+      { read -r name; read -r market; read -r fallback; read -r model; } < "$tmp/$i"
+      [[ $name == null ]] && name=
+      [[ -z $market ]] && market=$fallback
+      [[ $market == "$name" ]] && market=
+      names[i]=${name:-${market:-${serials[i]}}} markets[i]=$market models[i]=$model
+    done
+    rm -rf "$tmp"
+
+    # Columns padded by what they take on screen (wc -L): 荣耀 is two columns a character.
+    width() { printf %s "$1" | wc -L; }
+    pad() { printf '%s%*s' "$1" $(( $2 - $(width "$1") )) ''; }
+    wn=0 wm=0 wd=0
+    for i in "${!serials[@]}"; do
+      (( $(width "${names[i]}") > wn )) && wn=$(width "${names[i]}")
+      (( $(width "${markets[i]}") > wm )) && wm=$(width "${markets[i]}")
+      (( ${#models[i]} > wd )) && wd=${#models[i]}
+    done
+    rows=()
+    for i in "${!serials[@]}"; do
+      rows[i]="$(pad "${names[i]}" $wn)\e[22m   $(pad "${markets[i]}" $wm)   $(pad "${models[i]}" $wd)   \e[2m${serials[i]}"
+    done
+
+    sel=0
+    tput civis >&2
+    trap 'tput cnorm >&2' EXIT
+    printf '\e[1mWhich device?\e[0m  \e[2m↑/↓ move · Enter pick · q quit\e[0m\n\n' >&2
+    while :; do
+      for i in "${!serials[@]}"; do
+        if (( i == sel )); then printf '\e[7m ▸ \e[1m%b \e[0m\e[K\n' "${rows[i]}"
+        else printf '   \e[1m%b\e[0m\e[K\n' "${rows[i]}"
+        fi
+      done >&2
+      IFS= read -rsn1 key
+      if [[ $key == $'\e' ]]; then read -rsn2 -t 0.05 rest; key+=$rest; fi
+      case $key in
+        $'\e[A'|$'\eOA'|k) (( sel = (sel + n - 1) % n ));;
+        $'\e[B'|$'\eOB'|j) (( sel = (sel + 1) % n ));;
+        '') break;;
+        q|$'\e') printf '\e[%dA\e[J' $(( n + 2 )) >&2; exit 1;;
+      esac
+      printf '\e[%dA' $n >&2
+    done
+    printf '\e[%dA\e[J' $(( n + 2 )) >&2    # the DEVICE line says which it was
+    tput cnorm >&2
+    trap - EXIT
+    export ANDROID_SERIAL=${serials[sel]}
+  fi
+fi
 
 if [[ $1 =~ ^[0-9]+$ ]]; then
   export SYSMON_ID=$$    # exec keeps the pid: watch's, for every snapshot it runs
@@ -43,7 +115,11 @@ dexsum=none
 [[ -f $dex ]] && dexsum=$(md5sum < "$dex" | cut -d' ' -f1)
 
 # Passed as an argument, not on stdin: the jobs it runs would read stdin too.
-script="T=$T; ID=${SYSMON_ID:-once}; DEX=$dexsum; COLS=${cols:-80}; COLOR=$color; $(cat <<'EOF'
+# The serial the DEVICE line shows (the device's own when adb picked the only one).
+serial=${ANDROID_SERIAL:-$(adb get-serialno 2>/dev/null)}
+
+# Passed as an argument, not on stdin: the jobs it runs would read stdin too.
+script="T=$T; ID=${SYSMON_ID:-once}; DEX=$dexsum; COLS=${cols:-80}; COLOR=$color; SERIAL=$(printf %q "$serial"); $(cat <<'EOF'
 # Exit 3, before printing anything, when the device's pw.dex isn't ours.
 [ $DEX = none ] || [ "$(md5sum $T/pw.dex 2>/dev/null | cut -d' ' -f1)" = $DEX ] || exit 3
 
@@ -229,8 +305,20 @@ snapshot() {
   mv $S/net.new $S/net
   } > out
 
-  # --- POWER: printed first, once the battery current is in.
+  # --- DEVICE: whose stats these are. Then POWER, once the battery current is in.
   wait
+  # Its name (Settings → About), its marketing name (Honor's; the maker's
+  # otherwise), its model, Android release and adb serial.
+  market=$(getprop ro.config.marketing_name)
+  awk -v name="$(settings get global device_name)" -v market="${market:-$(getprop ro.product.manufacturer) $(getprop ro.product.model)}" \
+    -v model="$(getprop ro.product.model)" -v a="$(getprop ro.build.version.release)" -v s="$SERIAL" "$LIB"'
+    BEGIN {
+      if (name == "null" || name == market) name = ""
+      d = name != "" ? ENVIRON["H"] name ENVIRON["N"] "   \001" market : ENVIRON["H"] market ENVIRON["N"]
+      if (index(market, model) == 0) d = d " " dim("(" model ")")
+      head("DEVICE", d "   \001Android " a (s != "" ? "   \001" dim(s) : ""))
+    }'
+  echo
   dumpsys battery | awk -v cur="$(cat cur 2>/dev/null)" -v dex=$DEX -v avg=$S/avg "$LIB"'
     /^ *Charge counter:/ { cc = $3 }
     /^ *Max charging current:/ { mi = $4 } /^ *Max charging voltage:/ { mv = $4 }
