@@ -344,7 +344,13 @@ snapshot() {
     NF == 2 { u = $2 > 0 ? 100 * $1 / $2 : 0; s = sprintf("%.0f%%", u)
               head("GPU", (u >= 90 ? ENVIRON["H"] s ENVIRON["N"] : s) " busy " dim("(last second)")) }' /sys/class/kgsl/kgsl-3d0/gpubusy 2>/dev/null
 
-  # --- MEMORY, DISPLAY, NETWORK: a line each.
+  # --- MEMORY: a line, then each xp instance (dev.nxs.xp and its clones
+  # dev.nxs.xp.<name>), from its uid's memory cgroup, which holds every process
+  # of the app, guests included: the RAM charged to it (anonymous, the file pages
+  # it brought in, kernel) and its swap. Not ps's RSS, whose sum counts shared
+  # pages once per process. Installed in more than one user (App Twin), its
+  # uids summed. Not running: no populated cgroup. No xp, or no per-uid memory
+  # cgroups (older Android, cgroup v1): no rows.
   awk "$LIB"'
     /^(MemTotal|MemAvailable|SwapTotal|SwapFree):/ { m[$1] = $2 / 1048576 }
     END {
@@ -352,7 +358,34 @@ snapshot() {
       head("MEMORY", (m["MemAvailable:"] < 1 ? warn(free) : free) sprintf(" of %.1f GB free   \001swap %.1f of %.1f GB used",
         m["MemTotal:"], m["SwapTotal:"] - m["SwapFree:"], m["SwapTotal:"]))
     }' /proc/meminfo
-  awk -v b="$(settings get system screen_brightness)" "$LIB"'BEGIN { head("DISPLAY", "brightness " b) }'
+  cmd package list packages -U 2>/dev/null | awk "$LIB"'
+    function one(f,   v) { v = ""; getline v < f; close(f); return v }
+    function size(b) { return b < 1023.5 * 1048576 ? sprintf("%.0f MB", b / 1048576) : sprintf("%.1f GB", b / 1073741824) }
+    /^package:dev\.nxs\.xp(\.[^ ]+)? uid:[0-9]/ {
+      pkg = substr($1, 9); uids = substr($2, 5)
+      name = pkg == "dev.nxs.xp" ? "xp" : "xp " substr(pkg, 12)
+      if (length(name) > 11) name = substr(name, 1, 10) "~"    # row() leaves no space after 12
+      for (i = ++n; i > 1 && name < nm[i - 1]; i--) { nm[i] = nm[i - 1]; id[i] = id[i - 1] }
+      nm[i] = name; id[i] = uids
+    }
+    END {
+      if (one("/sys/fs/cgroup/apps/cgroup.subtree_control") !~ /(^| )memory( |$)/) exit
+      # The figures right-aligned on the widest, which starts under the free memory.
+      for (i = 1; i <= n; i++) {
+        k = split(id[i], u, ",")
+        for (j = 1; j <= k; j++) {
+          d = "/sys/fs/cgroup/apps/uid_" u[j]
+          if (one(d "/cgroup.events") != "populated 1") continue
+          up[i] = 1; b[i] += one(d "/memory.current"); sw[i] += one(d "/memory.swap.current")
+        }
+        if (up[i]) { ram[i] = size(b[i]); if (length(ram[i]) > w) w = length(ram[i]) }
+      }
+      for (i = 1; i <= n; i++)
+        if (!up[i]) row(nm[i], dim("not running"))
+        else row(nm[i], sprintf("%*s used", w, ram[i]) (sw[i] >= 1048576 ? "   \001swap " size(sw[i]) : ""))
+      if (n) print ""
+    }'
+  # --- NETWORK: a line.
   awk -v st=$S/net "$LIB"'
     BEGIN { while ((getline l < st) > 0) { split(l, f, " "); pr[f[1]] = f[2]; ptx[f[1]] = f[3]; pts = f[4] }
             getline up < "/proc/uptime"; split(up, U, " "); now = U[1] }
