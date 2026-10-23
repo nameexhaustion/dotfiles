@@ -1,23 +1,109 @@
 #!/usr/bin/env python3
-"""Connect adb to this machine's wireless-debugging port.
+"""Connect adb to a device's wireless-debugging port.
 
-Android picks a new random port each time wireless debugging starts, and
-mDNS doesn't reach us here, so: connect-scan every TCP port, greet each open
-one with an ADB CNXN, and `adb connect` to the one that answers like adbd.
+Wireless debugging listens on a new random port each time it's turned on, and
+mDNS may not reach us, so: connect-scan every TCP port, greet each open one
+with an ADB CNXN, and `adb connect` to the one that answers like adbd.
 
-usage: ~/adb [host]     (host defaults to 127.0.0.1)
+On this machine (loopback, the default) a device is taken only when its
+kernel's boot id is ours: a loopback port can be forwarded to another device.
+
+usage: adb [host | host:port | [v6 host]:port]
+
+A port given is tried first; if adbd isn't there (it moved), every port is
+scanned. A connection to the host that adb already has online is kept.
 """
-import errno, re, resource, select, socket, struct, subprocess, sys, time
+import errno, ipaddress, os, re, resource, select, socket, struct, subprocess, sys, time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 
-HOST = sys.argv[1] if len(sys.argv) > 1 else '127.0.0.1'
+USAGE = 'usage: adb [host | host:port | [v6 host]:port]   (host defaults to 127.0.0.1)'
 ADB_SERVER_PORT = 5037
 # Android's ephemeral range (where adbd's port lands) first, then the rest.
-PORTS = [p for p in (*range(32768, 61000), *range(1024, 32768), *range(61000, 65536))
-         if p != ADB_SERVER_PORT]
-BATCH = min(2000, resource.getrlimit(resource.RLIMIT_NOFILE)[0] - 64)
-CONNECT_WAIT = 0.3   # per batch; loopback answers in well under a millisecond
-PROBE_WAIT = 0.4
+PORT_ORDER = (*range(32768, 61000), *range(1024, 32768), *range(61000, 65536))
+BATCH = max(64, min(2000, resource.getrlimit(resource.RLIMIT_NOFILE)[0] - 64))
+MAX_PROBES = 256            # open ports greeted at once
+UNREACHABLE = (errno.ENETUNREACH, errno.EHOSTUNREACH)
+
+
+class Unreachable(Exception):
+    pass
+
+
+@dataclass
+class Target:
+    name: str               # as given
+    family: int
+    host: str               # address, with %scope for a link-local IPv6
+    sockaddr: tuple         # without the port
+    port: int | None        # given
+    local: bool             # this machine
+
+    @property
+    def serial_host(self):
+        return f'[{self.host}]' if self.family == socket.AF_INET6 else self.host
+
+    def serial(self, port):
+        return f'{self.serial_host}:{port}'
+
+    def addr(self, port):
+        return (self.sockaddr[0], port, *self.sockaddr[2:])
+
+    def matches(self, host):
+        """Whether a host of an adb serial is this target (on this machine: any loopback name)."""
+        if not self.local:
+            return host in (self.host, self.name)
+        return host == 'localhost' or is_local_ip(host)
+
+    @property
+    def ports(self):
+        return [p for p in PORT_ORDER if not (self.local and p == ADB_SERVER_PORT)]
+
+    @property
+    def connect_wait(self):  # per batch: loopback answers in well under a millisecond
+        return 0.3 if self.local else 1.0
+
+    @property
+    def probe_wait(self):
+        return 0.4 if self.local else 1.5
+
+
+def is_local_ip(host):
+    try:
+        ip = ipaddress.ip_address(host.split('%')[0])
+    except ValueError:
+        return False
+    return (getattr(ip, 'ipv4_mapped', None) or ip).is_loopback or ip.is_unspecified
+
+
+def parse_address(arg):
+    """(host, port or None) from host, host:port or [v6]:port; a bare v6 host has no port."""
+    if arg.startswith('['):
+        host, sep, rest = arg[1:].partition(']')
+        if not sep or (rest and not rest.startswith(':')):
+            raise ValueError(arg)
+        port = rest[1:] or None
+    elif arg.count(':') == 1:
+        host, port = arg.split(':')
+    else:
+        host, port = arg, None
+    if not host or host.startswith('-'):
+        raise ValueError(arg)
+    if port is not None:
+        if not (port.isascii() and port.isdigit() and 0 < int(port) < 65536):
+            raise ValueError(arg)
+        port = int(port)
+    return host, port
+
+
+def resolve(name, port):
+    """The Target for name: its first address, IPv4 preferred."""
+    infos = socket.getaddrinfo(name, None, type=socket.SOCK_STREAM)
+    family, *_, sockaddr = min(infos, key=lambda i: i[0] != socket.AF_INET)
+    host = sockaddr[0]
+    if family == socket.AF_INET6 and sockaddr[3] and '%' not in host:
+        host = f'{host}%{sockaddr[3]}'
+    return Target(name, family, host, sockaddr, port, is_local_ip(host))
 
 
 def adb(*args):
@@ -25,39 +111,75 @@ def adb(*args):
     return (r.stdout + r.stderr).strip()
 
 
-def devices():
-    """{serial: state} for this host's connections."""
-    lines = adb('devices').splitlines()[1:]
-    return {s: st for s, st in (l.split()[:2] for l in lines if l.strip())
-            if s.startswith(HOST + ':')}
+def port_of(serial):
+    return int(serial.rsplit(':', 1)[1])
 
 
-def open_ports():
-    found = []
-    for i in range(0, len(PORTS), BATCH):
-        pending = {}
-        ep = select.epoll()
-        for p in PORTS[i:i + BATCH]:
-            s = socket.socket()
-            s.setblocking(False)
-            e = s.connect_ex((HOST, p))
-            if e == errno.EINPROGRESS:
-                pending[s.fileno()] = (s, p)
-                ep.register(s, select.EPOLLOUT)
-                continue
-            if e == 0:
-                found.append(p)
-            s.close()
-        deadline = time.monotonic() + CONNECT_WAIT
-        while pending and (left := deadline - time.monotonic()) > 0:
-            for fd, _ in ep.poll(left):
-                s, p = pending.pop(fd)
-                if s.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR) == 0:
-                    found.append(p)
+def connections(target):
+    """{serial: state} of adb's connections to target."""
+    found = {}
+    for line in adb('devices').splitlines():
+        serial, _, state = line.partition('\t')
+        try:
+            host, port = parse_address(serial)
+        except ValueError:
+            continue
+        if port and target.matches(host):
+            found[serial] = state.strip()
+    return found
+
+
+def boot_id():
+    try:
+        with open('/proc/sys/kernel/random/boot_id') as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def is_mine(target, serial):
+    """Whether an online serial is the target (always off this machine, or when our boot id can't be read)."""
+    mine = boot_id() if target.local else None
+    return mine is None or adb('-s', serial, 'exec-out', 'cat /proc/sys/kernel/random/boot_id') == mine
+
+
+def open_ports(target):
+    """The target's ports that accept a connection; Unreachable when it doesn't answer at all."""
+    found, answered, ports = [], False, target.ports
+    for i in range(0, len(ports), BATCH):
+        pending, ep = {}, select.epoll()
+        try:
+            for p in ports[i:i + BATCH]:
+                s = socket.socket(target.family)
+                s.setblocking(False)
+                e = s.connect_ex(target.addr(p))
+                if e == errno.EINPROGRESS:
+                    pending[s.fileno()] = (s, p)
+                    ep.register(s, select.EPOLLOUT)
+                    continue
                 s.close()
-        for s, _ in pending.values():   # no answer in time: filtered
-            s.close()
-        ep.close()
+                if e in UNREACHABLE:
+                    raise Unreachable(os.strerror(e))
+                answered = True
+                if e == 0:
+                    found.append(p)
+            deadline = time.monotonic() + target.connect_wait
+            while pending and (left := deadline - time.monotonic()) > 0:
+                for fd, _ in ep.poll(left):
+                    s, p = pending.pop(fd)
+                    e = s.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+                    s.close()
+                    if e in UNREACHABLE:
+                        raise Unreachable(os.strerror(e))
+                    answered = True
+                    if e == 0:
+                        found.append(p)
+        finally:
+            for s, _ in pending.values():   # no answer in time: filtered
+                s.close()
+            ep.close()
+        if not answered:    # not even a refusal from a whole batch
+            raise Unreachable(f'no answer from {BATCH} ports')
     return found
 
 
@@ -68,66 +190,105 @@ def cnxn():
                        sum(data), cmd ^ 0xffffffff) + data
 
 
-def is_adbd(port):
+def is_adbd(target, port):
     """adbd answers a CNXN with CNXN, AUTH, or (wireless debugging) STLS."""
     try:
-        with socket.create_connection((HOST, port), PROBE_WAIT) as s:
-            s.settimeout(PROBE_WAIT)
+        with socket.socket(target.family) as s:
+            s.settimeout(target.probe_wait)
+            s.connect(target.addr(port))
             s.sendall(cnxn())
             return s.recv(4, socket.MSG_WAITALL) in (b'CNXN', b'AUTH', b'STLS')
     except OSError:
         return False
 
 
-def find_adbd():
-    ports = open_ports()
+def find_adbd(target, skip):
+    ports = [p for p in open_ports(target) if p not in skip]
     if not ports:
         return None
-    pool = ThreadPoolExecutor(len(ports))
-    futures = {pool.submit(is_adbd, p): p for p in ports}
+    pool = ThreadPoolExecutor(min(len(ports), MAX_PROBES))
+    futures = {pool.submit(is_adbd, target, p): p for p in ports}
     port = next((futures[f] for f in as_completed(futures) if f.result()), None)
     pool.shutdown(wait=False, cancel_futures=True)
     return port
+
+
+def candidates(target, others):
+    """adbd ports to connect to: the one given, then scans' finds (others: ports to skip,
+    added to by the caller). On this machine a few scans: right after a toggle the port
+    may still be moving."""
+    if target.port and target.port not in others and is_adbd(target, target.port):
+        yield target.port
+    for scan in range(3 if target.local else 1):
+        if scan:
+            time.sleep(0.5)
+        while (port := find_adbd(target, others)) is not None:
+            yield port
+            if port not in others:  # not another device's (which doesn't count as a scan)
+                break
 
 
 def report(serial, took):
     props = dict(re.findall(r'^\[(.+?)\]: \[(.*)\]$', adb('-s', serial, 'shell', 'getprop'), re.M))
     p = lambda k: props.get(k, '?')
     print(f'connected {serial} in {took:.1f}s\n'
-          f'  port:    {serial.rsplit(":", 1)[1]}\n'
+          f'  port:    {port_of(serial)}\n'
           f'  device:  {p("ro.product.manufacturer")} {p("ro.product.model")} '
           f'({p("ro.product.device")})\n'
           f'  android: {p("ro.build.version.release")} (SDK {p("ro.build.version.sdk")})')
 
 
-def main():
+def connect(target):
     t = time.monotonic()
-    for serial, state in devices().items():
-        if state == 'device':
+    others = set()              # ports of other devices (forwarded): left alone, skipped
+    for serial, state in connections(target).items():
+        if state != 'device':
+            adb('disconnect', serial)   # a port adbd no longer listens on
+        elif is_mine(target, serial):
             report(serial, time.monotonic() - t)
             return 0
-        adb('disconnect', serial)   # a port adbd no longer listens on
+        else:
+            others.add(port_of(serial))
+    if target.port in others:
+        print(f'{target.serial(target.port)} is another device (boot id): skipped', file=sys.stderr)
 
-    for attempt in range(3):        # right after a toggle the port may still be moving
-        if attempt:
-            time.sleep(0.5)
-        port = find_adbd()
-        if port is None:
-            continue
-        serial = f'{HOST}:{port}'
+    for port in candidates(target, others):
+        serial = target.serial(port)
         out = adb('connect', serial)
-        state = devices().get(serial)
-        if state == 'device':
+        state = connections(target).get(serial)
+        if state == 'device' and is_mine(target, serial):
             report(serial, time.monotonic() - t)
             return 0
         adb('disconnect', serial)
-        if state == 'unauthorized' or 'authenticate' in out:
+        if state == 'device':
+            print(f'{serial} is another device (boot id): skipped', file=sys.stderr)
+            others.add(port)
+        elif state == 'unauthorized' or 'authenticate' in out:
             print(f'{serial} is adbd but this host is not authorized: accept the prompt on the '
-                  f'device, or pair first (adb pair {HOST}:<pairing port>)', file=sys.stderr)
+                  f'device, or pair first (adb pair {target.serial_host}:<pairing port>)', file=sys.stderr)
             return 1
-    print(f'no adbd on {HOST}: is wireless debugging on?', file=sys.stderr)
+    print(f'no adbd on {target.name}'
+          + (f' but other devices\' (by boot id, ports {sorted(others)})' if others else '')
+          + ': is wireless debugging on?', file=sys.stderr)
     return 1
 
 
+def main(args):
+    try:
+        if len(args) > 1:
+            raise ValueError
+        name, port = parse_address(args[0]) if args else ('127.0.0.1', None)
+    except ValueError:
+        return USAGE
+    try:
+        target = resolve(name, port)
+    except OSError as e:
+        return f'{name}: {e.strerror or e}'
+    try:
+        return connect(target)
+    except Unreachable as e:
+        return f'{name} is unreachable ({e})' + ('' if port else '; if a firewall drops the scan, give the port')
+
+
 if __name__ == '__main__':
-    sys.exit(main())
+    sys.exit(main(sys.argv[1:]))
