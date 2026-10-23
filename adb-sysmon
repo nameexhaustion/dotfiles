@@ -113,6 +113,8 @@ fi
 # last once it's all in, so the screen never sits blank: "Connecting to …"
 # until the first, then the last one with its time, and "updating…" in the
 # header while the next is fetched. On the alternate screen, like watch.
+# q quits, at once, also while a snapshot is fetched (one left running ends by
+# itself, into a file that's gone).
 if [[ $1 =~ ^[0-9]+$ ]]; then
   export SYSMON_ID=$$    # the snapshots' baseline on the device, one per `sysmon N`
   [[ -z $NO_COLOR ]] && export SYSMON_COLOR=${SYSMON_COLOR:-1}
@@ -122,20 +124,36 @@ if [[ $1 =~ ^[0-9]+$ ]]; then
   dim= off=
   [[ $SYSMON_COLOR == 1 ]] && dim=$'\e[2m' off=$'\e[0m'
   title="sysmon · ${label:-${ANDROID_SERIAL:-the device}} · every $1 s"
+  [[ -t 0 ]] && title+=" · q quits"
   header() { printf '\e[H%s%s%s\e[K' "$dim" "$title${1:+ · $1}" "$off"; }
+  # Waits $1 s (fractions too), or less if q or Q, which quits, is pressed;
+  # other keys are dropped. Off a terminal, a sleep.
+  now() { local t=${EPOCHREALTIME//[!0-9]/}; echo $(( 10#$t )); }    # microseconds
+  pause() {
+    [[ -t 0 ]] || { sleep "$1"; return; }
+    local s=${1%.*} f=${1#*.}; [[ $1 == *.* ]] || f=
+    f=${f}000000; local end=$(( $(now) + 10#${s:-0} * 1000000 + 10#${f:0:6} )) left k
+    while (( (left = end - $(now)) > 0 )); do
+      IFS= read -rsn1 -t "$(( left / 1000000 )).$(printf %06d $(( left % 1000000 )))" k && [[ $k == [qQ] ]] && exit 0
+    done
+  }
   # Keys typed meanwhile aren't echoed into the frame (watch's curses does the same).
   tty=$(stty -g)
+  frame=$(mktemp)
   tput smcup; tput civis; stty -echo
-  trap 'stty "$tty"; tput cnorm; tput rmcup' EXIT
+  trap 'rm -f "$frame"; stty "$tty"; tput cnorm; tput rmcup' EXIT
   trap 'exit 130' INT TERM HUP
   printf '\e[H\e[J'; header; printf '\n\n%sConnecting to %s…%s' "$dim" "${label:-${ANDROID_SERIAL:-the device}}" "$off"
   while :; do
-    out=$(COLUMNS=$(tput cols) "$0" 2>&1)
+    COLUMNS=$(tput cols) "$0" < /dev/null > "$frame" 2>&1 &
+    fetch=$!
+    while kill -0 $fetch 2>/dev/null; do pause 0.1; done
+    out=$(< "$frame")
     at=$(date +%T)
     # Cut to the screen (two lines go to the header), each line clearing what
     # the last frame left after it.
     header "$at"; printf '\n\n%s\e[J' "$(head -n $(( $(tput lines) - 2 )) <<< "$out" | sed $'s/$/\e[K/')"
-    sleep "$1"
+    pause "$1"
     header "$at · updating…"
   done
 fi
