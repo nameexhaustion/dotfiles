@@ -4,7 +4,8 @@
 #   sysmon       one snapshot
 #   sysmon N     refresh every N seconds, full screen like watch
 #
-# With more than one device attached it asks which (ANDROID_SERIAL skips that).
+# With more than one device attached, or one that is not the device it runs on,
+# it asks which (ANDROID_SERIAL skips that).
 #
 # Colour goes to a terminal and to `sysmon N`; NO_COLOR=1 turns it off and
 # SYSMON_COLOR=1 or 0 forces it either way.
@@ -33,40 +34,80 @@ fi
 
 # More than one device: pick one with the arrow keys and Enter (q or Esc quits).
 # It's passed on in ANDROID_SERIAL, which adb reads, so every snapshot of
-# `sysmon N` uses it; set ANDROID_SERIAL yourself to skip the question. The
-# only one gets it too: adb itself would refuse to choose when an unauthorized
-# or offline device is attached as well.
+# `sysmon N` uses it, also once another device comes; set ANDROID_SERIAL
+# yourself to skip the question. The only one gets it too (adb itself would
+# refuse to choose when an unauthorized or offline device is attached as well)
+# when it's the one sysmon runs on (its kernel's boot id is ours, as ~/adb
+# checks); another is asked about too, so a remote one isn't watched unawares.
+# Off a terminal, where nothing can be asked, the only one is taken. Listed as
+# xp-deploy does: this device first, as "(this device)"; when adb has no
+# connection to it (and sysmon runs on an Android kernel, so it is one), a
+# greyed-out placeholder that the cursor passes over.
 if [[ -z $ANDROID_SERIAL ]]; then
   say "Looking for devices…"
   mapfile -t serials < <(adb devices 2>/dev/null | awk 'NR > 1 && $2 == "device" { print $1 }')
-  n=${#serials[@]}
-  (( n == 1 )) && export ANDROID_SERIAL=${serials[0]}
+  n=${#serials[@]} ask=
+  # This device, as ~/adb tells it: the one whose kernel's boot id is ours, or
+  # when ours can't be read, the one on a loopback address. On an Android kernel
+  # sysmon runs on a device, which then has its row also when not connected.
+  mine=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null) android=
+  [[ $(uname -r) == *android* ]] && android=1
+  is_this() {    # serial, its boot id
+    if [[ $mine ]]; then [[ $2 == "$mine" ]]; return; fi
+    local h=${1%:*}; h=${h#[}; h=${h%]}
+    [[ $h == localhost || $h == 127.* || $h == ::1 || $h == ::ffff:127.* || $h == 0.0.0.0 || $h == :: ]]
+  }
+  if (( n == 0 )); then
+    unsay
+    echo "sysmon: no device attached${android:+ (adb has no connection to this one either: ~/adb connects it)}" >&2
+    exit 1
+  fi
+  if (( n == 1 )); then
+    if [[ -t 0 && -t 2 ]] &&
+       ! is_this "${serials[0]}" "${mine:+$(timeout 3 adb -s "${serials[0]}" exec-out cat /proc/sys/kernel/random/boot_id 2>/dev/null)}"; then
+      ask=1
+    else
+      export ANDROID_SERIAL=${serials[0]}
+    fi
+  fi
   unsay
-  if (( n > 1 )); then
+  if (( n > 1 )) || [[ $ask ]]; then
     if [[ ! -t 0 || ! -t 2 ]]; then
       echo "sysmon: $n devices attached; set ANDROID_SERIAL to one of them" >&2
       exit 1
     fi
-    # Each device's name (Settings → About), its marketing name and its model,
-    # asked of all of them at once.
-    say "Asking the $n devices who they are…"
+    # Each device's name (Settings → About), its marketing name, its model and
+    # its boot id, asked of all of them at once.
+    if (( n > 1 )); then say "Asking the $n devices who they are…"; else say "Asking the device who it is…"; fi
     tmp=$(mktemp -d)
     trap 'rm -rf "$tmp"; unsay' EXIT
     for i in "${!serials[@]}"; do
       timeout 3 adb -s "${serials[i]}" shell 'settings get global device_name; getprop ro.config.marketing_name;
-        echo "$(getprop ro.product.manufacturer) $(getprop ro.product.model)"; getprop ro.product.model' > "$tmp/$i" 2>/dev/null &
+        echo "$(getprop ro.product.manufacturer) $(getprop ro.product.model)"; getprop ro.product.model;
+        cat /proc/sys/kernel/random/boot_id' > "$tmp/$i" 2>/dev/null &
     done
     wait
-    names=() markets=() models=()
+    names=() markets=() models=() here=
     for i in "${!serials[@]}"; do
-      { read -r name; read -r market; read -r fallback; read -r model; } < "$tmp/$i"
+      { read -r name; read -r market; read -r fallback; read -r model; read -r boot; } < "$tmp/$i"
       [[ $name == null ]] && name=
       [[ -z $market ]] && market=$fallback
       [[ $market == "$name" ]] && market=
       names[i]=${name:-${market:-${serials[i]}}} markets[i]=$market models[i]=$model
+      [[ -z $here ]] && is_this "${serials[i]}" "$boot" && here=$i
     done
     rm -rf "$tmp"
     unsay
+
+    # As xp-deploy lists them: this device first, tagged, and when adb has no
+    # connection to it a placeholder in its place that can't be picked (index n).
+    # Then the others.
+    order=() tag=0
+    if [[ $here ]]; then order=("$here"); tag=1
+    elif [[ $android ]]; then order=("$n"); tag=1
+    fi
+    for i in "${!serials[@]}"; do [[ $i == "$here" ]] || order+=("$i"); done
+    m=${#order[@]}
 
     # Columns padded by what they take on screen (wc -L): 荣耀 is two columns a character.
     width() { printf %s "$1" | wc -L; }
@@ -79,32 +120,40 @@ if [[ -z $ANDROID_SERIAL ]]; then
     done
     rows=()
     for i in "${!serials[@]}"; do
-      rows[i]="$(pad "${names[i]}" $wn)\e[22m   $(pad "${markets[i]}" $wm)   $(pad "${models[i]}" $wd)   \e[2m${serials[i]}"
+      t=; (( tag )) && if [[ $i == "$here" ]]; then t='(this device)  '; else t=$(pad '' 15); fi
+      rows[i]="$t$(pad "${names[i]}" $wn)\e[22m   $(pad "${markets[i]}" $wm)   $(pad "${models[i]}" $wd)   \e[2m${serials[i]}"
     done
+    rows[n]="(this device)  $(pad '' $wn)   $(pad '' $wm)   $(pad '' $wd)   not connected (run ~/adb)"
 
-    sel=0
+    # sel is a place in order; the placeholder, only ever first, is stepped over.
+    sel=0; (( order[0] == n )) && sel=1
     tput civis >&2
     trap 'tput cnorm >&2' EXIT
     printf '\e[1mWhich device?\e[0m  \e[2m↑/↓ move · Enter pick · q quit\e[0m\n\n' >&2
     while :; do
-      for i in "${!serials[@]}"; do
-        if (( i == sel )); then printf '\e[7m ▸ \e[1m%b \e[0m\e[K\n' "${rows[i]}"
+      for (( k = 0; k < m; k++ )); do
+        i=${order[k]}
+        if (( i == n )); then printf '   \e[2m%s\e[0m\e[K\n' "${rows[i]}"
+        elif (( k == sel )); then printf '\e[7m ▸ \e[1m%b \e[0m\e[K\n' "${rows[i]}"
         else printf '   \e[1m%b\e[0m\e[K\n' "${rows[i]}"
         fi
       done >&2
       IFS= read -rsn1 key
       if [[ $key == $'\e' ]]; then read -rsn2 -t 0.05 rest; key+=$rest; fi
       case $key in
-        $'\e[A'|$'\eOA'|k) (( sel = (sel + n - 1) % n ));;
-        $'\e[B'|$'\eOB'|j) (( sel = (sel + 1) % n ));;
+        $'\e[A'|$'\eOA'|k) step=$(( m - 1 ));;
+        $'\e[B'|$'\eOB'|j) step=1;;
         '') break;;
-        q|$'\e') printf '\e[%dA\e[J' $(( n + 2 )) >&2; exit 1;;
+        q|$'\e') printf '\e[%dA\e[J' $(( m + 2 )) >&2; exit 1;;
+        *) step=0;;
       esac
-      printf '\e[%dA' $n >&2
+      (( sel = (sel + step) % m, order[sel] == n && (sel = (sel + step) % m) ))
+      printf '\e[%dA' $m >&2
     done
-    printf '\e[%dA\e[J' $(( n + 2 )) >&2    # the DEVICE line says which it was
+    printf '\e[%dA\e[J' $(( m + 2 )) >&2    # the DEVICE line says which it was
     tput cnorm >&2
     trap - EXIT
+    sel=${order[sel]}
     export ANDROID_SERIAL=${serials[sel]} label=${names[sel]}
   fi
 fi
@@ -434,7 +483,7 @@ snapshot() {
       head("DEVICE", d "   \001Android " a (s != "" ? "   \001" dim(s) : ""))
     }'
   echo
-  dumpsys battery | awk -v cur="$(cat cur 2>/dev/null)" -v dex=$DEX -v avg=$S/avg "$LIB"'
+  dumpsys battery | awk -v cur="$(cat cur 2>/dev/null)" -v dex=$DEX -v avg=$S/avg -v ua=$T/ua "$LIB"'
     /^ *Charge counter:/ { cc = $3 }
     /^ *Max charging current:/ { mi = $4 } /^ *Max charging voltage:/ { mv = $4 }
     /^ *level:/ { lvl = $2 } /^ *voltage:/ { v = $2 } /^ *temperature:/ { t = $2 / 10 }
@@ -444,12 +493,16 @@ snapshot() {
     END {
       head("POWER", sprintf("%d%%, %s", lvl, st))
       row("Battery", sprintf("%.2f V, %.0f °C", v / 1000, t))
-      # Drivers report the current and the charge counter in matching units:
-      # uA and uAh (as Android documents), or mA and mAh (as some vendors do).
-      micro = cc > 100000
-      mah = micro ? cc / 1000 : cc
+      # Drivers report the charge counter in uAh (as Android documents) or mAh
+      # (as some vendors do), and the current in uA or mA, not always matching:
+      # the LDY-AN00 gives uAh and mA. A counter over 100,000 is uAh. A current
+      # over 30,000 is uA (30 A is beyond any battery here), which the device
+      # remembers in $T/ua; below that it is mA until such a reading is seen.
+      mah = cc > 100000 ? cc / 1000 : cc
       if (cur !~ /^-?[0-9]+$/) row("Flow", warn("current unavailable") " \001" dim(dex == "none" ? "(no pw.dex)" : "(pw.dex gave nothing)"))
       else {
+        micro = (getline x < ua) > 0; close(ua)
+        if (!micro && (cur > 30000 || cur < -30000)) { micro = 1; print 1 > ua; close(ua) }
         ma = micro ? cur / 1000 : cur
         w = ma * v / 1e6
         if (ma > 20) what = "charging the battery"
@@ -468,8 +521,10 @@ snapshot() {
           row("Remaining", sprintf("%dh %02dm %s \001", h, (h - int(h)) * 60, to) dim(sprintf("at %+.0f mA, %.0f of %.0f mAh", a, mah, mah * 100 / lvl)))
         }
       }
-      if (src != "") row("Charger", sprintf("up to %.1f W \001(%.1f A x %.2f V, %s)", mi * mv / 1e12, mi / 1e6, mv / 1e6, substr(src, 2)))
-      else row("Charger", dim("none"))
+      # Some health HALs (the LDY-AN00 one) leave the limits of the charger at 0.
+      if (src == "") row("Charger", dim("none"))
+      else if (mi > 0 && mv > 0) row("Charger", sprintf("up to %.1f W \001(%.1f A x %.2f V, %s)", mi * mv / 1e12, mi / 1e6, mv / 1e6, substr(src, 2)))
+      else row("Charger", substr(src, 2) " \001" dim("(no limits reported)"))
     }'
   echo
   cat out
