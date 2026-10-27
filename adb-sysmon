@@ -307,14 +307,29 @@ snapshot() {
 
   {
   # --- THERMAL: sysfs zones (m°C) grouped by block, and the framework's throttling status.
-  throttle=$(dumpsys thermalservice 2>/dev/null | awk '
+  # Where the zones are closed to the shell (MediaTek's: the TB336FU, the LDY-AN00),
+  # the thermal HAL's temperatures instead, grouped by their type. A sensor at 125 °C
+  # or more is a placeholder (the TB336FU's power amplifier, on a tablet with no modem).
+  dumpsys thermalservice > th 2>/dev/null
+  throttle=$(awk '
     /^Thermal Status:/ { split("none light moderate severe critical emergency shutdown", s, " "); st = s[$3 + 1] }
     /^Current temperatures from HAL/ { cur = 1; next }
-    cur && /mStatus=[1-9]/ { match($0, /mName=[^,]*/); hot = hot (hot ? ", " : "") substr($0, RSTART + 6, RLENGTH - 6) }
+    cur && /mStatus=[1-9]/ {
+      match($0, /mValue=[^,]*/); if (substr($0, RSTART + 7, RLENGTH - 7) + 0 >= 125) next
+      match($0, /mName=[^,]*/); hot = hot (hot ? ", " : "") substr($0, RSTART + 6, RLENGTH - 6)
+    }
     cur && !/Temperature/ { cur = 0 }
-    END { printf "%s%s", st, hot ? " (" hot ")" : "" }')
+    END { printf "%s%s", st, hot ? " (" hot ")" : "" }' th)
   grep -H . /sys/class/thermal/thermal_zone*/type /sys/class/thermal/thermal_zone*/temp 2>/dev/null |
   awk -F: -v throttle="$throttle" "$LIB"'
+    FILENAME == "th" {
+      if (/^Current temperatures from HAL/) { cur = 1; next }
+      if (!cur || !/Temperature/) { cur = 0; next }
+      match($0, /mValue=[^,]*/); t = substr($0, RSTART + 7, RLENGTH - 7) + 0
+      match($0, /mType=[^,]*/); ht = substr($0, RSTART + 6, RLENGTH - 6) + 0
+      if (t < 125) { hn++; hal[hn] = t; htype[hn] = ht }
+      next
+    }
     { split($1, p, "/"); z = p[5] }
     $1 ~ /type$/ { type[z] = $2; next }
     { temp[z] = $2 }
@@ -335,6 +350,21 @@ snapshot() {
       s = sprintf("%.0f", t)
       return t >= (chip ? 85 : 45) ? alarm(s) : t >= (chip ? 70 : 40) ? warn(s) : s
     }
+    function add(g, t) {
+      if (!(g in mx) || t > mx[g]) mx[g] = t
+      if (!(g in mn) || t < mn[g]) mn[g] = t
+    }
+    # The types of the HAL (android.os.Temperature): its chips as groups, and its
+    # skin, battery and USB port as the sensors Surface and Charging name.
+    function hgrp(ty) {
+      if (ty == 0) return "CPU"
+      if (ty == 1) return "GPU"
+      if (ty == 9 || ty == 10) return "NPU"
+      if (ty == 13) return "SoC"
+      if (ty == 5 || ty == 12) return "Modem/RF"
+      if (ty == 15) return "Camera"
+      return ""
+    }
     # "sensor:label" pairs, as "label 31   label 30 ...".
     function pairs(list,   k, a, out, n, m, i) {
       n = split(list, k, " ")
@@ -345,22 +375,29 @@ snapshot() {
       for (z in type) {
         n = type[z]; if (temp[z] == "") continue
         t = temp[z] / 1000; one[n] = t
-        g = grp(n); if (g == "") continue
-        if (!(g in mx) || t > mx[g]) mx[g] = t
-        if (!(g in mn) || t < mn[g]) mn[g] = t
+        sys = 1
+        g = grp(n); if (g != "") add(g, t)
+      }
+      if (!sys) for (i = 1; i <= hn; i++) {
+        t = hal[i]; ty = htype[i]
+        if ((g = hgrp(ty)) != "") add(g, t)
+        else if (ty == 2 || ty == 3 || ty == 4) {
+          n = ty == 2 ? "battery" : ty == 3 ? "hal_skin" : "usb_port"
+          if (!(n in one) || t > one[n]) one[n] = t
+        }
       }
       head("THERMAL", "throttling " (throttle == "" ? warn("unknown") : throttle == "none" ? dim("none") : alarm(throttle)))
-      split("CPU GPU NPU Memory SoC_rails Modem/RF Camera", order, " ")
+      split("CPU GPU NPU Memory SoC SoC_rails Modem/RF Camera", order, " ")
       for (i = 1; i in order; i++) {
         g = order[i]; gsub(/_/, " ", g); if (!(g in mx)) continue
         r = deg(mn[g], 1); if (sprintf("%.0f", mx[g]) != sprintf("%.0f", mn[g])) r = r "-" deg(mx[g], 1)
         row(g, r " °C")
       }
-      row("Surface", pairs("hot_pock:hotspot system_h:inside lcd:screen shell_front:front shell_back:back shell_frame:frame"))
+      row("Surface", pairs("hot_pock:hotspot system_h:inside lcd:screen shell_front:front shell_back:back shell_frame:frame hal_skin:skin"))
       s = pairs("charger:charger battery:battery usb_port:usb-port")
       if ("PMIC" in mx) s = s (s != "" ? "   \001" : "") "PMIC " deg(mx["PMIC"], 1)
       row("Charging", s)
-    }'
+    }' - th
   echo
 
   # --- CPU: each cluster's cores' use since the last snapshot, its clock and its
