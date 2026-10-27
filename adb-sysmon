@@ -436,7 +436,8 @@ snapshot() {
         cells = cells sprintf("%*s", 32 - 5 * nc, "")    # not %-32s: that would count the colour codes
         cur = val[q, "scaling_cur_freq"] / 1e6; hw = val[q, "cpuinfo_max_freq"] / 1e6; cap = val[q, "scaling_max_freq"] / 1e6
         s = sprintf("%.2f of %.2f GHz", cur, hw)
-        if (cap < hw) s = s ",\001 " warn(sprintf("capped at %.2f", cap))
+        # The cap is left out where it is closed to the shell (mtk-cpufreq-hw).
+        if (val[q, "scaling_max_freq"] != "" && cap < hw) s = s ",\001 " warn(sprintf("capped at %.2f", cap))
         if (np) s = s ",\001 " warn(np == nc ? "all parked" : np " parked")
         if (npart) s = s ",\001 " warn(npart " partly parked")
         row("cpu" c[1] "-" c[nc], cells " \001" s)
