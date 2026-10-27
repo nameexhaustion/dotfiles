@@ -458,8 +458,20 @@ snapshot() {
   # of the app, guests included: the RAM charged to it (anonymous, the file pages
   # it brought in, kernel) and its swap. Not ps's RSS, whose sum counts shared
   # pages once per process. Installed in more than one user (App Twin), its
-  # uids summed. Not running: no populated cgroup. No xp, or no per-uid memory
-  # cgroups (older Android, cgroup v1): no rows.
+  # uids summed. Not running: no populated cgroup. No xp: no rows. Without
+  # per-uid memory cgroups (the TB336FU: memory is cgroup v1 there, not per app,
+  # and the uid cgroups only do cpu), the anonymous RSS and swap of the uid's
+  # processes from /proc/<pid>/status, marked "~": what they hold privately,
+  # roughly (smaps is closed to the shell), without the file pages they share.
+  # Neither: no rows.
+  cmd package list packages -U 2>/dev/null > pkgs
+  { grep -qw memory /sys/fs/cgroup/apps/cgroup.subtree_control 2>/dev/null ||
+    for u in $(grep '^package:dev\.nxs\.xp[. ]' pkgs | sed 's/.*uid://' | tr , ' '); do
+      d=/sys/fs/cgroup/uid_$u
+      [ "$(head -1 $d/cgroup.events 2>/dev/null)" = "populated 1" ] || continue
+      awk -v u=$u '/^RssAnon:/ { a += $2 } /^VmSwap:/ { s += $2 } END { print u, a * 1024, s * 1024 }' \
+        $(sed 's|.*|/proc/&/status|' $d/pid_*/cgroup.procs) 2>/dev/null
+    done; } > procmem
   awk "$LIB"'
     /^(MemTotal|MemAvailable|SwapTotal|SwapFree):/ { m[$1] = $2 / 1048576 }
     END {
@@ -467,9 +479,10 @@ snapshot() {
       head("MEMORY", (m["MemAvailable:"] < 1 ? warn(free) : free) sprintf(" of %.1f GB free   \001swap %.1f of %.1f GB used",
         m["MemTotal:"], m["SwapTotal:"] - m["SwapFree:"], m["SwapTotal:"]))
     }' /proc/meminfo
-  cmd package list packages -U 2>/dev/null | awk "$LIB"'
+  awk "$LIB"'
     function one(f,   v) { v = ""; getline v < f; close(f); return v }
     function size(b) { return b < 1023.5 * 1048576 ? sprintf("%.0f MB", b / 1048576) : sprintf("%.1f GB", b / 1073741824) }
+    FILENAME == "procmem" { pa[$1] = $2; ps[$1] = $3; next }
     /^package:dev\.nxs\.xp(\.[^ ]+)? uid:[0-9]/ {
       pkg = substr($1, 9); uids = substr($2, 5)
       name = pkg == "dev.nxs.xp" ? "xp" : "xp " substr(pkg, 12)
@@ -478,22 +491,24 @@ snapshot() {
       nm[i] = name; id[i] = uids
     }
     END {
-      if (one("/sys/fs/cgroup/apps/cgroup.subtree_control") !~ /(^| )memory( |$)/) exit
+      cg = one("/sys/fs/cgroup/apps/cgroup.subtree_control") ~ /(^| )memory( |$)/
+      if (!cg && one("/sys/fs/cgroup/uid_0/cgroup.events") == "") exit
       # The figures right-aligned on the widest, which starts under the free memory.
       for (i = 1; i <= n; i++) {
         k = split(id[i], u, ",")
         for (j = 1; j <= k; j++) {
+          if (!cg) { if (u[j] in pa) { up[i] = 1; b[i] += pa[u[j]]; sw[i] += ps[u[j]] }; continue }
           d = "/sys/fs/cgroup/apps/uid_" u[j]
           if (one(d "/cgroup.events") != "populated 1") continue
           up[i] = 1; b[i] += one(d "/memory.current"); sw[i] += one(d "/memory.swap.current")
         }
-        if (up[i]) { ram[i] = size(b[i]); if (length(ram[i]) > w) w = length(ram[i]) }
+        if (up[i]) { ram[i] = (cg ? "" : "~") size(b[i]); if (length(ram[i]) > w) w = length(ram[i]) }
       }
       for (i = 1; i <= n; i++)
         if (!up[i]) row(nm[i], dim("not running"))
         else row(nm[i], sprintf("%*s used", w, ram[i]) (sw[i] >= 1048576 ? "   \001swap " size(sw[i]) : ""))
       if (n) print ""
-    }'
+    }' procmem pkgs
   # --- NETWORK: a line.
   awk -v st=$S/net "$LIB"'
     BEGIN { while ((getline l < st) > 0) { split(l, f, " "); pr[f[1]] = f[2]; ptx[f[1]] = f[3]; pts = f[4] }
