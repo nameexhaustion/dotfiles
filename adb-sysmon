@@ -446,12 +446,60 @@ snapshot() {
   mv $S/stat.new $S/stat
   echo
 
-  # --- GPU: busy over the driver's last ~1 s window, busy and total in us (both
-  # 0 when it was idle throughout). Not since the last snapshot, and the clock
-  # is closed to the shell user.
-  awk "$LIB"'
-    NF == 2 { u = $2 > 0 ? 100 * $1 / $2 : 0; s = sprintf("%.0f%%", u)
-              head("GPU", (u >= 90 ? ENVIRON["H"] s ENVIRON["N"] : s) " busy " dim("(last second)")) }' /sys/class/kgsl/kgsl-3d0/gpubusy 2>/dev/null
+  # --- GPU: how busy, the apps keeping it busy, and the memory it holds.
+  # Busy from kgsl (Qualcomm's) over the driver's last ~1 s window, busy and
+  # total in us (both 0 when it was idle throughout). Without it (Mali's devfreq
+  # and gpuinfo are closed to the shell: the PKM110, the LDY-AN00) from the work
+  # periods the GPU driver reports per uid (dumpsys gpu --gpuwork, Android 14's
+  # gpu_work_period), since the last snapshot: each uid's active time, summed,
+  # an upper bound as two uids' work can overlap. The apps by their share of
+  # that. The memory is gpuservice's global total, there also where the driver
+  # reports no work periods (the TB336FU). The clock is closed to the shell user.
+  cmd package list packages -U 2>/dev/null > pkgs
+  cat /sys/class/kgsl/kgsl-3d0/gpubusy > kgsl 2>/dev/null
+  dumpsys gpu --gpuwork > gwork 2>/dev/null
+  dumpsys gpu 2>/dev/null | grep -m1 '^Global total:' > gmem
+  awk -v st=$S/gpu "$LIB"'
+    BEGIN { while ((getline l < st) > 0) { split(l, f, " "); if (f[1] == "t") pt = f[2]; else pa[f[1]] = f[2]; had = 1 }
+            getline up < "/proc/uptime"; split(up, U, " "); now = U[1]
+            split("0 root 1000 system 1001 phone 1013 media 1041 audioserver 1047 cameraserver 2000 shell", sy, " ")
+            for (i = 1; i in sy; i += 2) nm[sy[i]] = sy[i + 1] }
+    FILENAME == "pkgs" {
+      if (!/ uid:[0-9]/) next
+      p = substr($1, 9); n = split(substr($2, 5), ul, ",")
+      if (p ~ /^dev\.nxs\.xp(\.|$)/) p = p == "dev.nxs.xp" ? "xp" : "xp " substr(p, 12)
+      for (i = 1; i <= n; i++) if (!(ul[i] in nm)) nm[ul[i]] = p
+      next
+    }
+    FILENAME == "kgsl" { if (NF == 2) { kb = $2 > 0 ? 100 * $1 / $2 : 0; k = 1 }; next }
+    FILENAME == "gmem" { mem = $3; next }
+    # gpu_id uid active inactive, in ns; the YLE-W09 prefixes one with "[errors:N]".
+    / [0-9]+ [0-9]+ [0-9]+$/ { act[$(NF - 2)] += $(NF - 1); gw = 1 }
+    END {
+      if (gw) {
+        print "t", now > (st ".new")
+        dt = had && now > pt ? now - pt : now
+        for (u in act) {
+          print u, act[u] > (st ".new")
+          d = act[u] - (had ? pa[u] : 0); if (d < 0) d = act[u]    # gpuservice restarted
+          sh = 100 * d / 1e9 / dt; sum += sh
+          if (sh >= 0.5) { for (i = ++na; i > 1 && sh > ash[i - 1]; i--) { ash[i] = ash[i - 1]; aid[i] = aid[i - 1] }; ash[i] = sh; aid[i] = u }
+        }
+      }
+      if (k) { b = kb; what = " busy " dim("(last second)") }
+      else if (gw) { b = sum > 100 ? 100 : sum; what = had ? " busy" : " busy since boot" }
+      if (k || gw) { s = sprintf("%.0f%%", b); h = (b >= 90 ? ENVIRON["H"] s ENVIRON["N"] : s) what }
+      if (mem > 0) h = h (h != "" ? "   \001" : "") (mem < 1023.5 * 1048576 ? sprintf("%.0f MB", mem / 1048576) : sprintf("%.1f GB", mem / 1073741824)) " memory"
+      if (h == "") exit
+      if (!k && !gw) h = h "   \001" dim("(busy closed to the shell)")
+      head("GPU", h)
+      for (i = 1; i <= na && i <= 4; i++) {
+        n = aid[i] in nm ? nm[aid[i]] : "uid " aid[i]; if (length(n) > 28) n = substr(n, 1, 27) "~"
+        a[i] = sprintf("%s %.0f%%", n, ash[i])
+      }
+      if (na) { row("Apps", join(a, i - 1)); print "" }
+    }' pkgs kgsl gmem gwork
+  [ -f $S/gpu.new ] && mv $S/gpu.new $S/gpu
 
   # --- MEMORY: a line, then each xp instance (dev.nxs.xp and its clones
   # dev.nxs.xp.<name>), from its uid's memory cgroup, which holds every process
@@ -463,8 +511,7 @@ snapshot() {
   # and the uid cgroups only do cpu), the anonymous RSS and swap of the uid's
   # processes from /proc/<pid>/status, marked "~": what they hold privately,
   # roughly (smaps is closed to the shell), without the file pages they share.
-  # Neither: no rows.
-  cmd package list packages -U 2>/dev/null > pkgs
+  # Neither: no rows. (pkgs is the GPU's.)
   { grep -qw memory /sys/fs/cgroup/apps/cgroup.subtree_control 2>/dev/null ||
     for u in $(grep '^package:dev\.nxs\.xp[. ]' pkgs | sed 's/.*uid://' | tr , ' '); do
       d=/sys/fs/cgroup/uid_$u
@@ -536,14 +583,22 @@ snapshot() {
       head("DEVICE", d "   \001Android " a (s != "" ? "   \001" dim(s) : ""))
     }'
   echo
-  dumpsys battery | awk -v cur="$(cat cur 2>/dev/null)" -v dex=$DEX -v avg=$S/avg -v ua=$T/ua "$LIB"'
+  # The battery's voltage and the charger's from sysfs where it's open (the
+  # PKM110's power_supply, the TB336FU's battery): uV, or mV (OPLUS's battery).
+  dumpsys battery | awk -v cur="$(cat cur 2>/dev/null)" -v dex=$DEX -v avg=$S/avg -v ua=$T/ua \
+    -v bv="$(cat /sys/class/power_supply/battery/voltage_now 2>/dev/null)" \
+    -v cv="$(cat /sys/class/power_supply/usb/voltage_now 2>/dev/null)" "$LIB"'
+    function mv(x) { return x > 100000 ? x / 1000 : x }
     /^ *Charge counter:/ { cc = $3 }
-    /^ *Max charging current:/ { mi = $4 } /^ *Max charging voltage:/ { mv = $4 }
+    /^ *Charger voltage :/ { cv = $4 * 1000 }    # OPLUS, mV
+    /^ *Max charging current:/ { mi = $4 } /^ *Max charging voltage:/ { maxv = $4 }
     /^ *level:/ { lvl = $2 } /^ *voltage:/ { v = $2 } /^ *temperature:/ { t = $2 / 10 }
     /^ *AC powered: true/ { src = src "/AC" } /^ *USB powered: true/ { src = src "/USB" }
     /^ *Wireless powered: true/ { src = src "/wireless" }
     /^ *status:/ { split("? unknown charging discharging not-charging full", s, " "); st = s[$2 + 1] }
     END {
+      # OPLUS gives the voltage in whole volts (4), sysfs in full.
+      if (v < 100) v = bv > 0 ? mv(bv) : v * 1000
       head("POWER", sprintf("%d%%, %s", lvl, st))
       row("Battery", sprintf("%.2f V, %.0f °C", v / 1000, t))
       # Drivers report the charge counter in uAh (as Android documents) or mAh
@@ -574,10 +629,15 @@ snapshot() {
           row("Remaining", sprintf("%dh %02dm %s \001", h, (h - int(h)) * 60, to) dim(sprintf("at %+.0f mA, %.0f of %.0f mAh", a, mah, mah * 100 / lvl)))
         }
       }
-      # Some health HALs (the LDY-AN00 one) leave the limits of the charger at 0.
+      # The limits of the charger are what the health HAL reports, not what flows:
+      # the PKM110 says 22 V x 3.2 A (71 W) on a 5 V bus with charging paused.
+      # Some (the LDY-AN00) leave them at 0. The bus voltage where sysfs has it.
       if (src == "") row("Charger", dim("none"))
-      else if (mi > 0 && mv > 0) row("Charger", sprintf("up to %.1f W \001(%.1f A x %.2f V, %s)", mi * mv / 1e12, mi / 1e6, mv / 1e6, substr(src, 2)))
-      else row("Charger", substr(src, 2) " \001" dim("(no limits reported)"))
+      else {
+        c = substr(src, 2) (cv > 0 ? sprintf(", %.2f V now", mv(cv) / 1000) : "") " \001"
+        if (mi > 0 && maxv > 0) row("Charger", c dim(sprintf("(reports up to %.1f W: %.1f A x %.2f V)", mi * maxv / 1e12, mi / 1e6, maxv / 1e6)))
+        else row("Charger", c dim("(no limits reported)"))
+      }
     }'
   echo
   cat out
