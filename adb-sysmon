@@ -585,7 +585,7 @@ snapshot() {
   echo
   # The battery's voltage and the charger's from sysfs where it's open (the
   # PKM110's power_supply, the TB336FU's battery): uV, or mV (OPLUS's battery).
-  dumpsys battery | awk -v cur="$(cat cur 2>/dev/null)" -v dex=$DEX -v avg=$S/avg -v ua=$T/ua \
+  dumpsys battery | awk -v cur="$(cat cur 2>/dev/null)" -v dex=$DEX -v avg=$S/avg -v ua=$T/ua -v inv=$T/inv \
     -v bv="$(cat /sys/class/power_supply/battery/voltage_now 2>/dev/null)" \
     -v cv="$(cat /sys/class/power_supply/usb/voltage_now 2>/dev/null)" "$LIB"'
     function mv(x) { return x > 100000 ? x / 1000 : x }
@@ -594,7 +594,7 @@ snapshot() {
     /^ *Max charging current:/ { mi = $4 } /^ *Max charging voltage:/ { maxv = $4 }
     /^ *level:/ { lvl = $2 } /^ *voltage:/ { v = $2 } /^ *temperature:/ { t = $2 / 10 }
     /^ *AC powered: true/ { src = src "/AC" } /^ *USB powered: true/ { src = src "/USB" }
-    /^ *Wireless powered: true/ { src = src "/wireless" }
+    /^ *Wireless powered: true/ { src = src "/wireless" } /^ *Dock powered: true/ { src = src "/dock" }
     /^ *status:/ { split("? unknown charging discharging not-charging full", s, " "); st = s[$2 + 1] }
     END {
       # OPLUS gives the voltage in whole volts (4), sysfs in full.
@@ -606,12 +606,23 @@ snapshot() {
       # the LDY-AN00 gives uAh and mA. A counter over 100,000 is uAh. A current
       # over 30,000 is uA (30 A is beyond any battery here), which the device
       # remembers in $T/ua; below that it is mA until such a reading is seen.
+      # Android has + as into the battery, but some drivers have it the other
+      # way (OPLUS: the PKM110 gives +600 mA unplugged). Nothing charges the
+      # battery without a charger, so the sign is taken from any snapshot that
+      # is discharging with no source, and remembered in $T/inv (1 inverted,
+      # 0 not) for when it is plugged in. Retaken each time, so a reading that
+      # straddles an unplug is put right by the next.
       mah = cc > 100000 ? cc / 1000 : cc
       if (cur !~ /^-?[0-9]+$/) row("Flow", warn("current unavailable") " \001" dim(dex == "none" ? "(no pw.dex)" : "(pw.dex gave nothing)"))
       else {
         micro = (getline x < ua) > 0; close(ua)
         if (!micro && (cur > 30000 || cur < -30000)) { micro = 1; print 1 > ua; close(ua) }
         ma = micro ? cur / 1000 : cur
+        neg = (getline x < inv) > 0 && x == 1; close(inv)
+        if (st == "discharging" && src == "" && (ma > 20 || ma < -20) && neg != (ma > 0)) {
+          neg = ma > 0; print neg > inv; close(inv)
+        }
+        if (neg) ma = -ma
         w = ma * v / 1e6
         if (ma > 20) what = "charging the battery"
         else if (ma >= -20) what = "idle"
