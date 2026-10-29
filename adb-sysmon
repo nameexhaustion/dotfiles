@@ -508,16 +508,18 @@ snapshot() {
   # pages once per process. Installed in more than one user (App Twin), its
   # uids summed. Not running: no populated cgroup. No xp: no rows. Without
   # per-uid memory cgroups (the TB336FU: memory is cgroup v1 there, not per app,
-  # and the uid cgroups only do cpu), the anonymous RSS and swap of the uid's
-  # processes from /proc/<pid>/status, marked "~": what they hold privately,
-  # roughly (smaps is closed to the shell), without the file pages they share.
+  # and the uid cgroups only do cpu; the PKM110: its are apps/uid_<uid>, also
+  # cpu only), the anonymous RSS and swap of the uid's processes from
+  # /proc/<pid>/status, marked "~": what they hold privately, roughly (smaps is
+  # closed to the shell), without the file pages they share.
   # Neither: no rows. (pkgs is the GPU's.)
   { grep -qw memory /sys/fs/cgroup/apps/cgroup.subtree_control 2>/dev/null ||
     for u in $(grep '^package:dev\.nxs\.xp[. ]' pkgs | sed 's/.*uid://' | tr , ' '); do
-      d=/sys/fs/cgroup/uid_$u
+      d=/sys/fs/cgroup/uid_$u; [ -d $d ] || d=/sys/fs/cgroup/apps/uid_$u
       [ "$(head -1 $d/cgroup.events 2>/dev/null)" = "populated 1" ] || continue
-      awk -v u=$u '/^RssAnon:/ { a += $2 } /^VmSwap:/ { s += $2 } END { print u, a * 1024, s * 1024 }' \
-        $(sed 's|.*|/proc/&/status|' $d/pid_*/cgroup.procs) 2>/dev/null
+      # cat, since awk stops at a file it can't open: a process gone mid-snapshot.
+      cat $(sed 's|.*|/proc/&/status|' $d/pid_*/cgroup.procs) 2>/dev/null |
+        awk -v u=$u '/^RssAnon:/ { a += $2 } /^VmSwap:/ { s += $2 } END { print u, a * 1024, s * 1024 }'
     done; } > procmem
   awk "$LIB"'
     /^(MemTotal|MemAvailable|SwapTotal|SwapFree):/ { m[$1] = $2 / 1048576 }
@@ -539,7 +541,7 @@ snapshot() {
     }
     END {
       cg = one("/sys/fs/cgroup/apps/cgroup.subtree_control") ~ /(^| )memory( |$)/
-      if (!cg && one("/sys/fs/cgroup/uid_0/cgroup.events") == "") exit
+      if (!cg && one("/sys/fs/cgroup/uid_0/cgroup.events") == "" && one("/sys/fs/cgroup/apps/cgroup.events") == "") exit
       # The figures right-aligned on the widest, which starts under the free memory.
       for (i = 1; i <= n; i++) {
         k = split(id[i], u, ",")
