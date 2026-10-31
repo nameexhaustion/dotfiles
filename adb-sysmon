@@ -582,7 +582,11 @@ snapshot() {
       if (name == "null" || name == market) name = ""
       d = name != "" ? ENVIRON["H"] name ENVIRON["N"] "   \001" market : ENVIRON["H"] market ENVIRON["N"]
       if (index(market, model) == 0) d = d " " dim("(" model ")")
-      head("DEVICE", d "   \001Android " a (s != "" ? "   \001" dim(s) : ""))
+      # One row, also in portrait: what does not fit is left off, the serial first.
+      cols = ENVIRON["COLS"] + 0; if (cols < 20) cols = 80
+      if (s != "" && 14 + shown(d "   Android " a "   " s) > cols) s = ""
+      if (14 + shown(d "   Android " a) > cols) a = ""
+      head("DEVICE", d (a != "" ? "   \001Android " a : "") (s != "" ? "   \001" dim(s) : ""))
     }'
   echo
   # The battery's voltage and the charger's from sysfs where it's open (the
