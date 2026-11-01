@@ -614,8 +614,9 @@ snapshot() {
       # remembers in $T/ua; below that it is mA until such a reading is seen.
       # Android has + as into the battery, but some drivers have it the other
       # way (OPLUS: the PKM110 gives +600 mA unplugged). Nothing charges the
-      # battery without a charger, so the sign is taken from any snapshot that
-      # is discharging with no source, and remembered in $T/inv (1 inverted,
+      # battery without a charger, so the sign is taken from any snapshot with
+      # no source, whatever its status (the CPH2343 says not-charging, not
+      # discharging, when unplugged), and remembered in $T/inv (1 inverted,
       # 0 not) for when it is plugged in. Retaken each time, so a reading that
       # straddles an unplug is put right by the next.
       mah = cc > 100000 ? cc / 1000 : cc
@@ -625,7 +626,7 @@ snapshot() {
         if (!micro && (cur > 30000 || cur < -30000)) { micro = 1; print 1 > ua; close(ua) }
         ma = micro ? cur / 1000 : cur
         neg = (getline x < inv) > 0 && x == 1; close(inv)
-        if (st == "discharging" && src == "" && (ma > 20 || ma < -20) && neg != (ma > 0)) {
+        if (src == "" && (ma > 20 || ma < -20) && neg != (ma > 0)) {
           neg = ma > 0; print neg > inv; close(inv)
         }
         if (neg) ma = -ma
