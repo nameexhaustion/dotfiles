@@ -521,13 +521,43 @@ snapshot() {
       cat $(sed 's|.*|/proc/&/status|' $d/pid_*/cgroup.procs) 2>/dev/null |
         awk -v u=$u '/^RssAnon:/ { a += $2 } /^VmSwap:/ { s += $2 } END { print u, a * 1024, s * 1024 }'
     done; } > procmem
-  awk "$LIB"'
+  # Then the tasks the kernel holds after they exited (the YLE-W09's kernel
+  # leaks them: 1.4 GB after 13 days; xp's docs/honor-task-leak.md): the
+  # task_structs in the slab less the threads not yet reaped (nr_threads, after
+  # the / in loadavg) and the idle tasks of the CPUs other than the first (the
+  # first's is static). Not task_struct - pid: pids outlive their tasks (process
+  # groups, sessions, pidfds), some hundreds of them. A dead task's
+  # signal_struct goes with its last reference, its sighand at reaping: so
+  # signal_cache - sighand_cache dead signals. Each object costs its share of
+  # its slab's pages; the figure is a floor (creds, LSM blobs left out). Freed
+  # objects in per-CPU slabs count as in use (up to ~200 task_structs), hence
+  # nothing under 1000. Not on devices whose slabinfo is closed to the shell
+  # (copied first, with loadavg read right after: awk stops at a file it can't
+  # open). Then a blank line, whether or not xp rows follow (memrow).
+  { grep -E '^(task_struct|signal_cache|sighand_cache) ' /proc/slabinfo; cat /proc/loadavg; } > slab 2>/dev/null
+  awk -v pg="$(getconf PAGESIZE 2>/dev/null)" -v cpus="$(cat /sys/devices/system/cpu/possible 2>/dev/null)" "$LIB"'
+    function size(b) { return b < 1023.5 * 1048576 ? sprintf("%.0f MB", b / 1048576) : sprintf("%.1f GB", b / 1073741824) }
+    FILENAME == "slab" {
+      if (NF == 5 && $4 ~ /\//) { split($4, L, "/"); threads = L[2] }
+      else if ($5 > 0) { n[$1] = $2; per[$1] = $6 * (pg > 0 ? pg : 4096) / $5 }
+      next
+    }
     /^(MemTotal|MemAvailable|SwapTotal|SwapFree):/ { m[$1] = $2 / 1048576 }
     END {
       free = sprintf("%.1f", m["MemAvailable:"])
       head("MEMORY", (m["MemAvailable:"] < 1 ? warn(free) : free) sprintf(" of %.1f GB free   \001swap %.1f of %.1f GB used",
         m["MemTotal:"], m["SwapTotal:"] - m["SwapFree:"], m["SwapTotal:"]))
-    }' /proc/meminfo
+      if (!("task_struct" in n) || threads == "" || cpus == "") exit
+      nc = split(cpus, r, ","); idle = -1    # "0-7" or "0-3,6"
+      for (i = 1; i <= nc; i++) { split(r[i], e, "-"); idle += (e[2] == "" ? 1 : e[2] - e[1] + 1) }
+      t = n["task_struct"] - threads - idle; s = n["signal_cache"] - n["sighand_cache"]
+      if (t < 1000) exit
+      b = t * per["task_struct"] + (s > 0 ? s * per["signal_cache"] : 0)
+      v = sprintf("%d, %s", t, size(b)); v = b >= 1073741824 ? alarm(v) : b >= 268435456 ? warn(v) : v
+      getline up < "/proc/uptime"; split(up, U, " ")
+      row("Dead tasks", v (U[1] >= 3600 ? "   \001" dim(sprintf("%.0f/h on average since boot", t * 3600 / U[1])) : ""))
+      print 1 > "memrow"
+    }' slab /proc/meminfo
   awk "$LIB"'
     function one(f,   v) { v = ""; getline v < f; close(f); return v }
     function size(b) { return b < 1023.5 * 1048576 ? sprintf("%.0f MB", b / 1048576) : sprintf("%.1f GB", b / 1073741824) }
@@ -541,7 +571,7 @@ snapshot() {
     }
     END {
       cg = one("/sys/fs/cgroup/apps/cgroup.subtree_control") ~ /(^| )memory( |$)/
-      if (!cg && one("/sys/fs/cgroup/uid_0/cgroup.events") == "" && one("/sys/fs/cgroup/apps/cgroup.events") == "") exit
+      if (!cg && one("/sys/fs/cgroup/uid_0/cgroup.events") == "" && one("/sys/fs/cgroup/apps/cgroup.events") == "") { if (one("memrow") != "") print ""; exit }
       # The figures right-aligned on the widest, which starts under the free memory.
       for (i = 1; i <= n; i++) {
         k = split(id[i], u, ",")
@@ -556,7 +586,7 @@ snapshot() {
       for (i = 1; i <= n; i++)
         if (!up[i]) row(nm[i], dim("not running"))
         else row(nm[i], sprintf("%*s used", w, ram[i]) (sw[i] >= 1048576 ? "   \001swap " size(sw[i]) : ""))
-      if (n) print ""
+      if (n || one("memrow") != "") print ""
     }' procmem pkgs
   # --- NETWORK: a line.
   awk -v st=$S/net "$LIB"'
