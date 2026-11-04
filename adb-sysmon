@@ -403,9 +403,15 @@ snapshot() {
   # --- CPU: each cluster's cores' use since the last snapshot, its clock and its
   # cap, and the cores core_ctl has parked (paused: nothing runs there) or partly
   # parked (only some tasks may run there).
+  # The clusters' hardware maxima are read once, each by a process of its own,
+  # and kept in $T/cpumax: the YLE-W09's kernel keeps the task_struct of any
+  # process that reads cpuinfo_max_freq twice, once it exits (one a snapshot
+  # when a grep read them all; xp's docs/honor-task-leak.md).
   cat /sys/devices/system/cpu/cpu0/core_ctl/global_state > park 2>/dev/null
-  grep -H . /sys/devices/system/cpu/cpufreq/policy*/related_cpus /sys/devices/system/cpu/cpufreq/policy*/scaling_cur_freq \
-    /sys/devices/system/cpu/cpufreq/policy*/scaling_max_freq /sys/devices/system/cpu/cpufreq/policy*/cpuinfo_max_freq > freq 2>/dev/null
+  [ -s $T/cpumax ] || for p in /sys/devices/system/cpu/cpufreq/policy*; do
+    echo "$p/cpuinfo_max_freq:$(cat $p/cpuinfo_max_freq 2>/dev/null)"; done > $T/cpumax
+  { grep -H . /sys/devices/system/cpu/cpufreq/policy*/related_cpus /sys/devices/system/cpu/cpufreq/policy*/scaling_cur_freq \
+      /sys/devices/system/cpu/cpufreq/policy*/scaling_max_freq; cat $T/cpumax; } > freq 2>/dev/null
   awk -v st=$S/stat "$LIB"'
     BEGIN { while ((getline l < st) > 0) { split(l, f, " "); pt[f[1]] = f[2]; pi[f[1]] = f[3]; had = 1 } }
     FILENAME == "park" {
