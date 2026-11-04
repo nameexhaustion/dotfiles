@@ -533,7 +533,8 @@ snapshot() {
   # objects in per-CPU slabs count as in use (up to ~200 task_structs), hence
   # nothing under 1000. Not on devices whose slabinfo is closed to the shell
   # (copied first, with loadavg read right after: awk stops at a file it can't
-  # open). Then a blank line, whether or not xp rows follow (memrow).
+  # open). Passed on in memrow (bytes, tasks, rate) to the xp rows' awk, whose
+  # figures it lines up with.
   { grep -E '^(task_struct|signal_cache|sighand_cache) ' /proc/slabinfo; cat /proc/loadavg; } > slab 2>/dev/null
   awk -v pg="$(getconf PAGESIZE 2>/dev/null)" -v cpus="$(cat /sys/devices/system/cpu/possible 2>/dev/null)" "$LIB"'
     function size(b) { return b < 1023.5 * 1048576 ? sprintf("%.0f MB", b / 1048576) : sprintf("%.1f GB", b / 1073741824) }
@@ -552,14 +553,18 @@ snapshot() {
       for (i = 1; i <= nc; i++) { split(r[i], e, "-"); idle += (e[2] == "" ? 1 : e[2] - e[1] + 1) }
       t = n["task_struct"] - threads - idle; s = n["signal_cache"] - n["sighand_cache"]
       if (t < 1000) exit
-      b = t * per["task_struct"] + (s > 0 ? s * per["signal_cache"] : 0)
-      v = sprintf("%d, %s", t, size(b)); v = b >= 1073741824 ? alarm(v) : b >= 268435456 ? warn(v) : v
       getline up < "/proc/uptime"; split(up, U, " ")
-      row("Dead tasks", v (U[1] >= 3600 ? "   \001" dim(sprintf("%.0f/h on average since boot", t * 3600 / U[1])) : ""))
-      print 1 > "memrow"
+      rate = U[1] >= 3600 ? sprintf("%.0f/h on average since boot", t * 3600 / U[1]) : ""
+      printf "%.0f\t%d\t%s\n", t * per["task_struct"] + (s > 0 ? s * per["signal_cache"] : 0), t, rate > "memrow"
     }' slab /proc/meminfo
   awk "$LIB"'
     function one(f,   v) { v = ""; getline v < f; close(f); return v }
+    # The dead tasks first: their memory, at the width w of the xp rows, then their number.
+    function dead(   v) {
+      if (!hd) return
+      v = sprintf("%*s", w, size(dk[1])); v = dk[1] >= 1073741824 ? alarm(v) : dk[1] >= 268435456 ? warn(v) : v
+      row("Dead tasks", v ", " dk[2] " tasks" (dk[3] != "" ? "   \001" dim(dk[3]) : ""))
+    }
     function size(b) { return b < 1023.5 * 1048576 ? sprintf("%.0f MB", b / 1048576) : sprintf("%.1f GB", b / 1073741824) }
     FILENAME == "procmem" { pa[$1] = $2; ps[$1] = $3; next }
     /^package:dev\.nxs\.xp(\.[^ ]+)? uid:[0-9]/ {
@@ -571,7 +576,8 @@ snapshot() {
     }
     END {
       cg = one("/sys/fs/cgroup/apps/cgroup.subtree_control") ~ /(^| )memory( |$)/
-      if (!cg && one("/sys/fs/cgroup/uid_0/cgroup.events") == "" && one("/sys/fs/cgroup/apps/cgroup.events") == "") { if (one("memrow") != "") print ""; exit }
+      if ((d = one("memrow")) != "") { hd = split(d, dk, "\t"); w = length(size(dk[1])) }
+      if (!cg && one("/sys/fs/cgroup/uid_0/cgroup.events") == "" && one("/sys/fs/cgroup/apps/cgroup.events") == "") { if (hd) { dead(); print "" }; exit }
       # The figures right-aligned on the widest, which starts under the free memory.
       for (i = 1; i <= n; i++) {
         k = split(id[i], u, ",")
@@ -583,10 +589,11 @@ snapshot() {
         }
         if (up[i]) { ram[i] = (cg ? "" : "~") size(b[i]); if (length(ram[i]) > w) w = length(ram[i]) }
       }
+      dead()
       for (i = 1; i <= n; i++)
         if (!up[i]) row(nm[i], dim("not running"))
         else row(nm[i], sprintf("%*s used", w, ram[i]) (sw[i] >= 1048576 ? "   \001swap " size(sw[i]) : ""))
-      if (n || one("memrow") != "") print ""
+      if (n || hd) print ""
     }' procmem pkgs
   # --- NETWORK: a line.
   awk -v st=$S/net "$LIB"'
