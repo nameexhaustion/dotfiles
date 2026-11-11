@@ -191,10 +191,13 @@ if [[ $1 =~ ^[0-9]+$ ]]; then
     done
   }
   # Keys typed meanwhile aren't echoed into the frame (watch's curses does the same).
+  # No autowrap: a line wider than the screen (the title, or a frame laid out
+  # before the terminal narrowed) is cut at its edge instead of taking a second
+  # row and scrolling the header off.
   tty=$(stty -g)
   frame=$(mktemp)
-  tput smcup; tput civis; stty -echo
-  trap 'kill $keys $nap 2>/dev/null; rm -f "$frame"; stty "$tty"; tput cnorm; tput rmcup' EXIT
+  tput smcup; tput civis; tput rmam; stty -echo
+  trap 'kill $keys $nap 2>/dev/null; rm -f "$frame"; stty "$tty"; tput smam; tput cnorm; tput rmcup' EXIT
   trap 'exit 130' INT TERM HUP
   printf '\e[H\e[J'; header; printf '\n\n%sConnecting to %s…%s' "$dim" "${label:-${ANDROID_SERIAL:-the device}}" "$off"
   while :; do
@@ -202,9 +205,10 @@ if [[ $1 =~ ^[0-9]+$ ]]; then
     waitq $!
     out=$(< "$frame")
     at=$(date +%T)
-    # Cut to the screen (two lines go to the header), each line clearing what
-    # the last frame left after it.
-    header "$at"; printf '\n\n%s\e[J' "$(head -n $(( $(tput lines) - 2 )) <<< "$out" | sed $'s/$/\e[K/')"
+    # Cut to the screen (two lines go to the header, the blank one cleared too:
+    # a resize's reflow can leave a row there), each line clearing what the
+    # last frame left after it.
+    header "$at"; printf '\n\e[K\n%s\e[J' "$(head -n $(( $(tput lines) - 2 )) <<< "$out" | sed $'s/$/\e[K/')"
     sleep "$1" &
     nap=$!; waitq $nap; nap=
     header "$at · updating…"
