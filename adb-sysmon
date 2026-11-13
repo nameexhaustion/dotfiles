@@ -20,7 +20,7 @@
 #
 # Generic Android (toybox, mksh, dumpsys) except where noted: the thermal zone
 # names, core_ctl's parked cores and the GPU's kgsl are Qualcomm's, and the surface sensors are
-# one vendor's. Whatever a device lacks is left out.
+# two vendors' (Honor's shell_*, Lenovo's *_temp). Whatever a device lacks is left out.
 
 # What it's doing while the terminal would otherwise sit blank: one dim line on
 # stderr, cleared once there's something else to show. Not for the snapshots
@@ -397,7 +397,7 @@ snapshot() {
         r = deg(mn[g], 1); if (sprintf("%.0f", mx[g]) != sprintf("%.0f", mn[g])) r = r "-" deg(mx[g], 1)
         row(g, r " °C")
       }
-      row("Surface", pairs("hot_pock:hotspot system_h:inside lcd:screen shell_front:front shell_back:back shell_frame:frame hal_skin:skin"))
+      row("Surface", pairs("hot_pock:hotspot system_h:inside lcd:screen shell_front:front shell_back:back shell_frame:frame front_temp:front back_temp:back user_temp:user skin-msm-therm:skin hal_skin:skin"))
       s = pairs("charger:charger battery:battery usb_port:usb-port")
       if ("PMIC" in mx) s = s (s != "" ? "   \001" : "") "PMIC " deg(mx["PMIC"], 1)
       row("Charging", s)
