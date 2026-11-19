@@ -111,6 +111,10 @@ class Target:
         return 0.3 if self.local else 1.0
 
     @property
+    def first_wait(self):  # the first batch: a phone's Wi-Fi in power save wakes slowly
+        return 0.3 if self.local else 5.0
+
+    @property
     def probe_wait(self):
         return 0.4 if self.local else 1.5
 
@@ -214,7 +218,8 @@ def open_ports(target):
                 answered = True
                 if e == 0:
                     found.append(p)
-            deadline = time.monotonic() + target.connect_wait
+            # Until something answers, allow for a dozing Wi-Fi link (its first answers take >1s).
+            deadline = time.monotonic() + (target.connect_wait if ever_answered else target.first_wait)
             while pending and (left := deadline - time.monotonic()) > 0:
                 for fd, _ in ep.poll(left):
                     s, p = pending.pop(fd)
