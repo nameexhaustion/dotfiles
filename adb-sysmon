@@ -15,8 +15,9 @@
 # previous snapshot, kept on the device in /data/local/tmp/sysmon/state.<id>:
 # one id per `sysmon N`, one shared by single snapshots, so two copies running
 # at once don't take each other's baseline. The battery current comes from
-# pw.dex, built from ~/.cache/sysmon/Pw.java and run with app_process, since
-# sysfs's power_supply is closed to the shell user; without it the rest still works.
+# pw.dex (sysmon-pw.dex beside this script, from sysmon-Pw.java), run with
+# app_process, since sysfs's power_supply is closed to the shell user; without it
+# the rest still works.
 #
 # Generic Android (toybox, mksh, dumpsys) except where noted: the thermal zone
 # names, core_ctl's parked cores and the GPU's kgsl are Qualcomm's, and the surface sensors are
@@ -216,7 +217,8 @@ if [[ $1 =~ ^[0-9]+$ ]]; then
 fi
 
 T=/data/local/tmp/sysmon
-dex=~/.cache/sysmon/pw.dex
+dex=$(dirname "$(readlink -f "$0")")/sysmon-pw.dex
+[[ -f $dex ]] || dex=~/.cache/sysmon/pw.dex   # a copy of this script on its own
 
 if [[ -n $NO_COLOR ]]; then color=0
 elif [[ -n $SYSMON_COLOR ]]; then color=$SYSMON_COLOR
