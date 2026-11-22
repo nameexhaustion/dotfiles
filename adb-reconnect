@@ -23,7 +23,23 @@ ADB_SERVER_PORT = 5037
 # Android's ephemeral range (where adbd's port lands) first, then the rest.
 PORT_RANGES = (range(32768, 61000), range(1024, 32768), range(61000, 65536))
 MAX_PROBES = 256            # open ports greeted at once (while the scan goes on)
-BATCH = max(64, min(2000, resource.getrlimit(resource.RLIMIT_NOFILE)[0] - 64 - MAX_PROBES))
+
+
+def batch_size(want=2000):
+    """Ports connected to at once: up to want, the soft fd limit raised towards the hard
+    one for it (orbuntu's soft limit is 1024)."""
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    need = want + 64 + MAX_PROBES
+    if soft != resource.RLIM_INFINITY and soft < need:
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (need if hard == resource.RLIM_INFINITY else min(need, hard), hard))
+        except (ValueError, OSError):
+            pass
+        soft = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
+    return want if soft == resource.RLIM_INFINITY else max(64, min(want, soft - 64 - MAX_PROBES))
+
+
+BATCH = batch_size()
 UNREACHABLE = (errno.ENETUNREACH, errno.EHOSTUNREACH)
 
 
@@ -107,7 +123,7 @@ class Target:
                 for r in PORT_RANGES for i in range(r.start, r.stop, BATCH)]
 
     @property
-    def connect_wait(self):  # per batch: loopback answers in well under a millisecond
+    def connect_wait(self):  # per batch, at least: loopback answers in well under a millisecond
         return 0.3 if self.local else 1.0
 
     @property
@@ -197,12 +213,15 @@ def is_mine(target, serial):
 
 def open_ports(target):
     """Yields, batch by batch, the target's ports that accept a connection. A batch without
-    an answer (not even a refusal) ends the scan: Unreachable when nothing has answered."""
-    opened, ever_answered, batches = 0, False, target.batches
+    an answer (not even a refusal) ends the scan: Unreachable when nothing has answered.
+    Each batch is given twice the slowest answer so far: behind a NAT that drops a first SYN
+    (OrbStack's), every answer comes after the 1s SYN retransmit."""
+    opened, ever_answered, slowest, batches = 0, False, 0.0, target.batches
     for n, batch in enumerate(batches, 1):
         progress(f'scanning {bar((n - 1) / len(batches))}  ports {batch[0]}–{batch[-1]}, '
                  f'{opened} open', frequent=True)
         found, answered, pending, ep = [], False, {}, select.epoll()
+        start = time.monotonic()
         try:
             for p in batch:
                 s = socket.socket(target.family)
@@ -219,7 +238,7 @@ def open_ports(target):
                 if e == 0:
                     found.append(p)
             # Until something answers, allow for a dozing Wi-Fi link (its first answers take >1s).
-            deadline = time.monotonic() + (target.connect_wait if ever_answered else target.first_wait)
+            deadline = start + (max(target.connect_wait, 2 * slowest) if ever_answered else target.first_wait)
             while pending and (left := deadline - time.monotonic()) > 0:
                 for fd, _ in ep.poll(left):
                     s, p = pending.pop(fd)
@@ -228,6 +247,7 @@ def open_ports(target):
                     if e in UNREACHABLE:
                         raise Unreachable(os.strerror(e))
                     answered = True
+                    slowest = max(slowest, time.monotonic() - start)
                     if e == 0:
                         found.append(p)
         finally:
@@ -340,8 +360,13 @@ def connect(target):
         serial = target.serial(port)
         progress.prefix = ''
         progress(f'connecting {serial}')
-        out = adb('connect', serial)
-        state = connections(target).get(serial)
+        for attempt in range(3):            # adbd, just greeted, can turn the first one down
+            if attempt:
+                time.sleep(0.5)
+            out = adb('connect', serial)
+            state = connections(target).get(serial)
+            if state or not out.startswith('failed to connect'):
+                break
         if state == 'device' and is_mine(target, serial):
             report(serial, time.monotonic() - t)
             return 0
