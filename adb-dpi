@@ -1,0 +1,529 @@
+#!/usr/bin/env python3
+"""Show and change the effective DPI of Android displays over ADB."""
+
+import argparse
+import curses
+import ipaddress
+import os
+import re
+import subprocess
+import sys
+import unicodedata
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+
+
+class AdbError(Exception):
+    pass
+
+
+LOCAL_TAG = "(this device)"
+
+
+@dataclass
+class Device:
+    serial: str | None
+    state: str
+    model: str = ""
+    name: str = ""
+    mine: bool = False
+
+    @property
+    def usable(self):
+        return self.serial is not None and self.state == "device"
+
+    @property
+    def what(self):
+        if self.serial is None:
+            return ""
+        if self.name and self.model and self.model not in self.name:
+            return f"{self.name} ({self.model})"
+        return self.name or self.model or "?"
+
+
+@dataclass(frozen=True)
+class Display:
+    id: int
+    name: str
+    kind: str
+    unique_id: str
+
+    @property
+    def internal(self):
+        return self.kind in ("INTERNAL", "BUILT_IN") or (
+            not self.kind and (
+                self.id == 0 or self.name.lower().startswith(("built-in", "built in"))
+            )
+        )
+
+
+DISPLAY_LINE = re.compile(r"Display id (\d+):\s*DisplayInfo\{(.+)")
+DISPLAY_INFO = re.compile(r'^"(.*?)"(,\s*(?:displayId|uniqueId|app)\b.*)')
+ENTER = (curses.KEY_ENTER, 10, 13)
+QUIT = (ord("q"), 27, curses.ERR)
+
+
+def adb(*args, allow_failure=False):
+    try:
+        result = subprocess.run(
+            ["adb", *args],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+        )
+    except FileNotFoundError as error:
+        raise AdbError("adb was not found on PATH") from error
+    except subprocess.TimeoutExpired as error:
+        raise AdbError("adb timed out") from error
+    output = result.stdout.strip()
+    if not allow_failure and (
+        result.returncode
+        or re.search(r"^\s*(?:Error:|Exception occurred|Remote exception:)", output, re.M)
+    ):
+        detail = output.splitlines()[0] if output else f"adb exited {result.returncode}"
+        raise AdbError(detail)
+    return output
+
+
+def get_devices():
+    devices = []
+    output = adb("devices", "-l").partition("List of devices attached")[2]
+    for line in output.splitlines():
+        fields = line.split()
+        if len(fields) < 2 or fields[0] == "*":
+            continue
+        serial, state, *details = fields
+        if state == "no" and details[:1] == ["permissions"]:
+            state = "no permissions"
+        model = next((field[6:] for field in details if field.startswith("model:")), "")
+        devices.append(Device(serial, state, model.replace("_", " ")))
+    return devices
+
+
+def is_loopback(serial):
+    host = serial.rsplit(":", 1)[0].strip("[]").split("%")[0]
+    if host == "localhost":
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    ip = getattr(ip, "ipv4_mapped", None) or ip
+    return ip.is_loopback or ip.is_unspecified
+
+
+def read_device(device):
+    if not device.usable:
+        return ""
+    try:
+        output = adb(
+            "-s", device.serial, "exec-out",
+            'printf "%s\\n" "boot_id=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)" '
+            '"device_name=$(settings get global device_name 2>/dev/null)" '
+            '"model=$(getprop ro.product.model 2>/dev/null)"',
+        )
+    except AdbError:
+        return ""
+    values = dict(line.split("=", 1) for line in output.splitlines() if "=" in line)
+    name = values.get("device_name", "").strip()
+    device.name = name if name != "null" else ""
+    if not device.model:
+        device.model = values.get("model", "").strip().replace("_", " ")
+    return values.get("boot_id", "").strip()
+
+
+def identify_devices(devices):
+    try:
+        with open("/proc/sys/kernel/random/boot_id") as boot_file:
+            local_boot = boot_file.read().strip()
+    except OSError:
+        local_boot = ""
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        boot_ids = list(pool.map(read_device, devices))
+    local = next((device for device, boot_id in zip(devices, boot_ids)
+                  if local_boot and boot_id == local_boot), None)
+    if not local_boot:
+        local = next((device for device in devices
+                      if device.usable and is_loopback(device.serial)), None)
+    if local is not None:
+        local.mine = True
+    return local
+
+
+def parse_displays(output, *, dumpsys=False):
+    base_info = "mBaseDisplayInfo=DisplayInfo{"
+    display_id = None
+    displays = {}
+    for line in output.splitlines():
+        line = line.strip()
+        if dumpsys:
+            if match := re.fullmatch(r"mDisplayId=(\d+)", line):
+                display_id = int(match[1])
+            if display_id is None or not line.startswith(base_info):
+                continue
+            details = line[len(base_info):]
+        else:
+            match = DISPLAY_LINE.fullmatch(line)
+            if not match:
+                continue
+            display_id, details = int(match[1]), match[2]
+        match = DISPLAY_INFO.match(details)
+        if not match:
+            display_id = None
+            continue
+        name, info = match.groups()
+        # Android 10 included the ID inside the name's closing quote.
+        if not info.startswith(", displayId "):
+            name = re.sub(r", displayId \d+$", "", name)
+        kind = re.search(r',\s*type\s+([A-Z_]+)\s*(?:,|\})', info)
+        unique_id = re.search(r',\s*uniqueId\s+"([^"]+)"', info)
+        displays[display_id] = Display(
+            display_id, name, kind[1] if kind else "", unique_id[1] if unique_id else ""
+        )
+        display_id = None
+    return sorted(displays.values(), key=lambda display: (not display.internal, display.id))
+
+
+class Android:
+    def __init__(self, serial):
+        self.serial = serial
+        # Android may exit nonzero after printing valid wm help.
+        help_text = self.shell("wm", "help", allow_failure=True)
+        self.per_display = bool(re.search(r"^\s*density\s+[^\n]*\[-d\s", help_text, re.M))
+
+    def shell(self, *args, allow_failure=False):
+        return adb("-s", self.serial, "shell", *args, allow_failure=allow_failure)
+
+    def displays(self):
+        current = parse_displays(self.shell("cmd", "display", "get-displays", allow_failure=True))
+        if not current:
+            current = parse_displays(self.shell("dumpsys", "display"), dumpsys=True)
+        if not current:
+            raise AdbError("No logical displays found")
+        return current
+
+    def density_command(self, display, *args):
+        if self.per_display:
+            return self.shell("wm", "density", *args, "-d", str(display.id))
+        if display.id == 0:
+            return self.shell("wm", "density", *args)
+        raise AdbError("This device's wm density does not advertise -d")
+
+    def read_density(self, display):
+        output = self.density_command(display)
+        values = dict(re.findall(r"^(Physical|Override) density:\s*(-?\d+)\s*$", output, re.M))
+        dpi = int(values.get("Override", values.get("Physical", "0")))
+        if dpi <= 0:
+            raise AdbError(f"Display {display.id} DPI unavailable")
+        return dpi
+
+
+def cell_width(char):
+    if not char.isprintable():
+        return 1
+    if unicodedata.combining(char):
+        return 0
+    return 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
+
+
+def fit(value, width):
+    cells = 0
+    clipped = []
+    for char in value:
+        size = cell_width(char)
+        if cells + size > width:
+            break
+        clipped.append(char if char.isprintable() else " ")
+        cells += size
+    return "".join(clipped), cells
+
+
+def write_line(screen, y, value, attr=0, *, x=0):
+    _, width = screen.getmaxyx()
+    if x >= width - 1:
+        return 0
+    text, cells = fit(value, width - x - 1)
+    if text:
+        try:
+            screen.addstr(y, x, text, attr)
+        except curses.error:
+            pass  # A resize can invalidate the row between getmaxyx and addstr.
+    return cells
+
+
+def write_shortcuts(screen, y, shortcuts):
+    x = 0
+    for key, description in shortcuts:
+        if x:
+            x += write_line(screen, y, " · ", curses.A_DIM, x=x)
+        x += write_line(screen, y, key, curses.A_BOLD, x=x)
+        x += write_line(screen, y, f" {description}", curses.A_DIM, x=x)
+
+
+def move_selection(key, selected, count):
+    if count:
+        if key in (curses.KEY_UP, ord("k")):
+            selected = (selected - 1) % count
+        elif key in (curses.KEY_DOWN, ord("j")):
+            selected = (selected + 1) % count
+    return selected
+
+
+def show_rows(screen, rows, selected, start, room, offset):
+    if room <= 0:
+        return offset
+    offset = scroll_offset(offset, selected, room, len(rows))
+    for index, row in enumerate(rows[offset:offset + room], offset):
+        attr = curses.A_REVERSE if selected == index else 0
+        write_line(screen, start + index - offset, row, attr)
+    return offset
+
+
+def scroll_offset(offset, selected, room, count):
+    return max(0, min(max(offset, selected - room + 1), selected, count - room))
+
+
+def use_terminal_colors():
+    try:
+        curses.use_default_colors()
+    except curses.error:
+        pass
+
+
+def choose_device(screen, devices):
+    try:
+        curses.curs_set(0)
+    except curses.error:
+        pass
+    selected = offset = 0
+    selectable = [index for index, device in enumerate(devices) if device.usable]
+    widest_name = max(sum(map(cell_width, device.what)) for device in devices)
+    while True:
+        screen.erase()
+        height, width = screen.getmaxyx()
+        start = 2 if height >= 5 else int(height >= 3)
+        if start:
+            write_line(screen, 0, "Select an ADB device", curses.A_BOLD)
+        has_shortcuts = height >= 2
+        gap = int(height >= 6)
+        room = height - start - has_shortcuts - gap
+        tag_width = len(LOCAL_TAG) + 2 if width >= 48 else 0
+        name_width = min(widest_name, (width - tag_width) // 2)
+        chosen = selectable[selected]
+        rows = []
+        for index, device in enumerate(devices):
+            if index == 1 and room >= 3 and width > 2:
+                rows.append((" " + "─" * min(40, width - 3), curses.A_DIM))
+            tag = LOCAL_TAG if device.mine else ""
+            name, cells = fit(device.what, name_width)
+            name += " " * (name_width - cells)
+            state = "" if device.usable else f"  —  {device.state}"
+            serial = device.serial + state if device.serial else "not connected (run ~/adb)"
+            if tag_width:
+                label = f" {tag:{tag_width}}{name}  {serial} "
+            elif device.serial:
+                label = f" {name}  {serial}{'  ' + tag if tag else ''} "
+            else:
+                label = f" {tag}  {serial} "
+            if not device.usable:
+                attr = curses.A_DIM
+            else:
+                attr = curses.A_BOLD if device.mine else 0
+            if index == chosen:
+                selected_row = len(rows)
+                attr |= curses.A_REVERSE
+            rows.append((label, attr))
+        offset = scroll_offset(offset, selected_row, room, len(rows))
+        for y, (label, attr) in enumerate(rows[offset:offset + room], start):
+            write_line(screen, y, label, attr)
+        if has_shortcuts:
+            write_shortcuts(screen, start + min(room, len(rows)) + gap,
+                            (("↑/↓ j/k", "move"), ("Enter", "select"), ("q", "quit")))
+        key = screen.getch()
+        if key in ENTER:
+            return devices[chosen]
+        if key in QUIT:
+            return None
+        selected = move_selection(key, selected, len(selectable))
+
+
+def read_displays(device):
+    displays = device.displays()
+    values = {}
+    for display in displays:
+        try:
+            values[display.id] = device.read_density(display)
+        except AdbError as error:
+            values[display.id] = str(error)
+    return displays, values
+
+
+def edit_displays(screen, target):
+    try:
+        curses.curs_set(1)
+    except curses.error:
+        pass
+    local = f"  {LOCAL_TAG}" if target.mine else ""
+    heading = f"{target.what}  {target.serial}{local}"
+    screen.erase()
+    write_line(screen, 0, heading, curses.A_BOLD)
+    if screen.getmaxyx()[0] >= 2:
+        write_line(screen, 1, "Loading displays…", curses.A_DIM)
+    screen.refresh()
+    device = Android(target.serial)
+    selected = offset = 0
+    draft = status = ""
+    displays, values = [], {}
+    try:
+        displays, values = read_displays(device)
+    except AdbError as error:
+        status = str(error)
+
+    while True:
+        screen.erase()
+        height, width = screen.getmaxyx()
+        gap = int(height >= 10)
+        start = 1 + gap if height >= 5 else 0
+        if start:
+            write_line(screen, 0, heading, curses.A_BOLD)
+        has_shortcuts = height >= 4
+        has_status = bool(status) and (height >= 3 or (height == 2 and not displays))
+        room = height - start - 1 - has_shortcuts - has_status - 2 * gap
+        id_width = max((len(str(display.id)) for display in displays), default=1)
+        dpi_width = max((len(str(value)) for value in values.values() if isinstance(value, int)), default=1)
+        rows = []
+        for display in displays:
+            value = values[display.id]
+            dpi, detail = (str(value), "") if isinstance(value, int) else ("—", f"  ({value})")
+            rows.append(f" {display.id:>{id_width}}  {dpi:>{dpi_width}} DPI  {display.name}{detail} ")
+        if not rows:
+            rows.append("No displays")
+        elif height == 2 and status:
+            rows[selected] += f" · {status}"
+        offset = show_rows(screen, rows, selected, start, room, offset)
+        footer = start + min(room, len(rows)) + gap
+        if has_shortcuts:
+            write_shortcuts(screen, footer,
+                            (("↑/↓ j/k", "move"), ("Enter", "set"), ("r", "refresh"), ("q", "quit")))
+            footer += 1
+        if has_status:
+            write_line(screen, footer, status)
+        label = "New DPI: " if width >= 14 else "> "
+        capacity = max(0, width - len(label) - 1)
+        visible = draft[-capacity:] if capacity else ""
+        write_line(screen, height - 1, label + visible, curses.A_BOLD)
+        screen.move(height - 1, min(width - 1, len(label) + len(visible)))
+
+        key = screen.getch()
+        if key in QUIT:
+            return
+        if ord("0") <= key <= ord("9"):
+            draft += chr(key)
+            status = ""
+        elif key in (curses.KEY_BACKSPACE, 8, 127):
+            draft = draft[:-1]
+            status = ""
+        elif key == ord("r"):
+            current = displays[selected] if displays else None
+            try:
+                displays, values = read_displays(device)
+                if current is not None and current not in displays:
+                    selected = 0
+                    draft = ""
+                    status = f"Display {current.id} changed. Selection reset."
+                else:
+                    selected = displays.index(current) if current is not None else 0
+                    status = "Refreshed"
+            except AdbError as error:
+                displays, values = [], {}
+                selected = 0
+                if current is not None:
+                    draft = ""
+                status = str(error)
+        elif key in ENTER:
+            if not draft:
+                status = "Enter a DPI value first"
+                continue
+            if not displays:
+                status = "No display selected. Press r to refresh."
+                continue
+            display = displays[selected]
+            digits = draft.lstrip("0")
+            if not digits or len(digits) > 10 or not 72 <= int(digits) <= 2147483647:
+                status = "DPI must be between 72 and 2147483647"
+                continue
+            dpi = int(digits)
+            try:
+                if display not in device.displays():
+                    raise AdbError(f"Display {display.id} changed. Press r to refresh.")
+                device.density_command(display, str(dpi))
+            except AdbError as error:
+                status = str(error)
+                continue
+            try:
+                actual = device.read_density(display)
+            except AdbError as error:
+                values[display.id] = str(error)
+                status = f"Could not verify display {display.id}: {error}"
+                continue
+            values[display.id] = actual
+            if actual == dpi:
+                status = f"Display {display.id} set to {actual} DPI"
+                draft = ""
+            else:
+                status = f"Display {display.id} reports {actual} DPI (requested {dpi})"
+        else:
+            selected = move_selection(key, selected, len(displays))
+
+
+def run_session(screen, target, devices):
+    use_terminal_colors()
+    if target is None:
+        target = choose_device(screen, devices)
+    if target is not None:
+        edit_displays(screen, target)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("-s", metavar="SERIAL", help="ADB device serial (overrides ANDROID_SERIAL)")
+    args = parser.parse_args()
+    try:
+        serial = args.s or os.environ.get("ANDROID_SERIAL")
+        target = Device(serial, "device") if serial else None
+        devices = []
+        if target is None:
+            devices = get_devices()
+            online = [device for device in devices if device.usable]
+            if not online:
+                raise AdbError("No online ADB devices")
+            if len(online) == 1:
+                target = online[0]
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+            raise AdbError("An interactive terminal is required")
+        if target is not None:
+            if serial:
+                try:
+                    target = next((device for device in get_devices() if device.serial == serial), target)
+                except AdbError:
+                    pass
+            identify_devices([target])
+        else:
+            local = identify_devices(devices)
+            others = [device for device in devices if device is not local]
+            devices = [local or Device(None, "missing", mine=True), *others]
+        curses.wrapper(run_session, target, devices)
+    except KeyboardInterrupt:
+        return 130
+    except (AdbError, curses.error) as error:
+        print(f"adb-dpi: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
